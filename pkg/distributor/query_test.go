@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/grafana/dskit/ring"
 	"github.com/grafana/dskit/user"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
@@ -795,3 +796,107 @@ type byLabels []labels.Labels
 func (b byLabels) Len() int           { return len(b) }
 func (b byLabels) Swap(i, j int)      { b[i], b[j] = b[j], b[i] }
 func (b byLabels) Less(i, j int) bool { return labels.Compare(b[i], b[j]) < 0 }
+
+func TestApplyStrictQuorum(t *testing.T) {
+	tests := map[string]struct {
+		instances               []ring.InstanceDesc
+		expectedMaxUnavailable  int
+		expectedMinRequiredZone int
+	}{
+		"single zone with single instance": {
+			instances: []ring.InstanceDesc{
+				{Addr: "instance-1", Zone: "zone-a"},
+			},
+			expectedMaxUnavailable:  0,
+			expectedMinRequiredZone: 1,
+		},
+		"single zone with multiple instances": {
+			instances: []ring.InstanceDesc{
+				{Addr: "instance-1", Zone: "zone-a"},
+				{Addr: "instance-2", Zone: "zone-a"},
+				{Addr: "instance-3", Zone: "zone-a"},
+			},
+			expectedMaxUnavailable:  0,
+			expectedMinRequiredZone: 1,
+		},
+		"two zones - need both (quorum is 2)": {
+			instances: []ring.InstanceDesc{
+				{Addr: "instance-1", Zone: "zone-a"},
+				{Addr: "instance-2", Zone: "zone-b"},
+			},
+			expectedMaxUnavailable:  0, // 2 - (2/2 + 1) = 2 - 2 = 0
+			expectedMinRequiredZone: 2,
+		},
+		"three zones - need 2 of 3 (quorum is 2)": {
+			instances: []ring.InstanceDesc{
+				{Addr: "instance-1", Zone: "zone-a"},
+				{Addr: "instance-2", Zone: "zone-b"},
+				{Addr: "instance-3", Zone: "zone-c"},
+			},
+			expectedMaxUnavailable:  1, // 3 - (3/2 + 1) = 3 - 2 = 1
+			expectedMinRequiredZone: 2,
+		},
+		"three zones with multiple instances per zone - need 2 of 3 (quorum is 2)": {
+			instances: []ring.InstanceDesc{
+				{Addr: "instance-1a", Zone: "zone-a"},
+				{Addr: "instance-1b", Zone: "zone-a"},
+				{Addr: "instance-2a", Zone: "zone-b"},
+				{Addr: "instance-2b", Zone: "zone-b"},
+				{Addr: "instance-3a", Zone: "zone-c"},
+				{Addr: "instance-3b", Zone: "zone-c"},
+			},
+			expectedMaxUnavailable:  1, // 3 - (3/2 + 1) = 3 - 2 = 1
+			expectedMinRequiredZone: 2,
+		},
+		"four zones - need 3 of 4 (quorum is 3)": {
+			instances: []ring.InstanceDesc{
+				{Addr: "instance-1", Zone: "zone-a"},
+				{Addr: "instance-2", Zone: "zone-b"},
+				{Addr: "instance-3", Zone: "zone-c"},
+				{Addr: "instance-4", Zone: "zone-d"},
+			},
+			expectedMaxUnavailable:  1, // 4 - (4/2 + 1) = 4 - 3 = 1
+			expectedMinRequiredZone: 3,
+		},
+		"five zones - need 3 of 5 (quorum is 3)": {
+			instances: []ring.InstanceDesc{
+				{Addr: "instance-1", Zone: "zone-a"},
+				{Addr: "instance-2", Zone: "zone-b"},
+				{Addr: "instance-3", Zone: "zone-c"},
+				{Addr: "instance-4", Zone: "zone-d"},
+				{Addr: "instance-5", Zone: "zone-e"},
+			},
+			expectedMaxUnavailable:  2, // 5 - (5/2 + 1) = 5 - 3 = 2
+			expectedMinRequiredZone: 3,
+		},
+		"empty instances": {
+			instances:               []ring.InstanceDesc{},
+			expectedMaxUnavailable:  0,
+			expectedMinRequiredZone: 0,
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			rs := ring.ReplicationSet{
+				Instances:            testData.instances,
+				MaxUnavailableZones:  100, // Set to high value to ensure it gets overwritten
+				ZoneAwarenessEnabled: true,
+			}
+
+			result := applyStrictQuorum(rs)
+
+			assert.Equal(t, testData.expectedMaxUnavailable, result.MaxUnavailableZones,
+				"MaxUnavailableZones mismatch")
+
+			// Verify the quorum calculation by checking min required zones
+			uniqueZones := make(map[string]struct{})
+			for _, inst := range testData.instances {
+				uniqueZones[inst.Zone] = struct{}{}
+			}
+			actualMinRequired := len(uniqueZones) - result.MaxUnavailableZones
+			assert.Equal(t, testData.expectedMinRequiredZone, actualMinRequired,
+				"minimum required zones mismatch")
+		})
+	}
+}

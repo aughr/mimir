@@ -9260,3 +9260,124 @@ func (m *MockTimeSource) Sleep(d time.Duration) {
 func (m *MockTimeSource) Add(d time.Duration) {
 	m.CurrentTime = m.CurrentTime.Add(d)
 }
+
+func TestDistributor_usePartitionRouting(t *testing.T) {
+	tests := map[string]struct {
+		writePercentage int
+		hash            uint32
+		expected        bool
+	}{
+		"percentage 0 always returns false": {
+			writePercentage: 0,
+			hash:            0,
+			expected:        false,
+		},
+		"percentage 0 with hash 50 returns false": {
+			writePercentage: 0,
+			hash:            50,
+			expected:        false,
+		},
+		"percentage 0 with hash 99 returns false": {
+			writePercentage: 0,
+			hash:            99,
+			expected:        false,
+		},
+		"percentage 100 always returns true with hash 0": {
+			writePercentage: 100,
+			hash:            0,
+			expected:        true,
+		},
+		"percentage 100 always returns true with hash 50": {
+			writePercentage: 100,
+			hash:            50,
+			expected:        true,
+		},
+		"percentage 100 always returns true with hash 99": {
+			writePercentage: 100,
+			hash:            99,
+			expected:        true,
+		},
+		"percentage 100 always returns true with large hash": {
+			writePercentage: 100,
+			hash:            12345678,
+			expected:        true,
+		},
+		"percentage 50 with hash 0 returns true (0 < 50)": {
+			writePercentage: 50,
+			hash:            0,
+			expected:        true, // 0 % 100 = 0 < 50
+		},
+		"percentage 50 with hash 49 returns true (49 < 50)": {
+			writePercentage: 50,
+			hash:            49,
+			expected:        true, // 49 % 100 = 49 < 50
+		},
+		"percentage 50 with hash 50 returns false (50 >= 50)": {
+			writePercentage: 50,
+			hash:            50,
+			expected:        false, // 50 % 100 = 50 >= 50
+		},
+		"percentage 50 with hash 99 returns false (99 >= 50)": {
+			writePercentage: 50,
+			hash:            99,
+			expected:        false, // 99 % 100 = 99 >= 50
+		},
+		"percentage 50 with hash 100 returns true (100 % 100 = 0 < 50)": {
+			writePercentage: 50,
+			hash:            100,
+			expected:        true, // 100 % 100 = 0 < 50
+		},
+		"percentage 50 with hash 149 returns true (149 % 100 = 49 < 50)": {
+			writePercentage: 50,
+			hash:            149,
+			expected:        true, // 149 % 100 = 49 < 50
+		},
+		"percentage 50 with hash 150 returns false (150 % 100 = 50 >= 50)": {
+			writePercentage: 50,
+			hash:            150,
+			expected:        false, // 150 % 100 = 50 >= 50
+		},
+		"percentage 10 with hash 9 returns true (9 < 10)": {
+			writePercentage: 10,
+			hash:            9,
+			expected:        true, // 9 % 100 = 9 < 10
+		},
+		"percentage 10 with hash 10 returns false (10 >= 10)": {
+			writePercentage: 10,
+			hash:            10,
+			expected:        false, // 10 % 100 = 10 >= 10
+		},
+		"percentage 90 with hash 89 returns true (89 < 90)": {
+			writePercentage: 90,
+			hash:            89,
+			expected:        true, // 89 % 100 = 89 < 90
+		},
+		"percentage 90 with hash 90 returns false (90 >= 90)": {
+			writePercentage: 90,
+			hash:            90,
+			expected:        false, // 90 % 100 = 90 >= 90
+		},
+		"percentage over 100 is treated as 100": {
+			writePercentage: 150,
+			hash:            99,
+			expected:        true,
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			d := &Distributor{
+				cfg: Config{
+					IngestStorageConfig: ingest.Config{
+						Migration: ingest.MigrationConfig{
+							WritePercentage: testData.writePercentage,
+						},
+					},
+				},
+			}
+
+			result := d.usePartitionRouting(testData.hash)
+			assert.Equal(t, testData.expected, result)
+		})
+	}
+}

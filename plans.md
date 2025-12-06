@@ -43,7 +43,7 @@ This document tracks the implementation progress of the partition ring without K
 
 | Task | Status | File(s) | Notes |
 |------|--------|---------|-------|
-| Skip Kafka reader setup when disabled | ⬜ TODO | `pkg/ingester/ingester.go` | Future work - conditional initialization |
+| Skip Kafka reader setup when disabled | ✅ DONE | `pkg/ingester/ingester.go` | Conditionally skip Kafka reader when kafka.enabled: false |
 | Verify partition lifecycler runs | ✅ DONE | N/A | Already works with existing infrastructure |
 
 ### Phase 6: Metrics
@@ -61,14 +61,22 @@ This document tracks the implementation progress of the partition ring without K
 | Task | Status | File(s) | Notes |
 |------|--------|---------|-------|
 | Write path quorum tests | ⬜ TODO | `pkg/distributor/distributor_test.go` | Critical - future work |
-| Read path quorum tests | ⬜ TODO | TBD | Critical - future work |
-| Migration routing tests | ⬜ TODO | `pkg/distributor/distributor_test.go` | Future work |
-| Config validation tests | ⬜ TODO | `pkg/storage/ingest/config_test.go` | Future work |
+| Read path quorum tests (`applyStrictQuorum`) | ✅ DONE | `pkg/distributor/query_test.go` | Added `TestApplyStrictQuorum` |
+| Migration routing tests (`usePartitionRouting`) | ✅ DONE | `pkg/distributor/distributor_test.go` | Added `TestDistributor_usePartitionRouting` |
+| Config validation tests | ✅ DONE | `pkg/storage/ingest/config_test.go` | Added tests for WritePercentage, PartitionIsolationEnabled, KafkaDisabled |
 | Integration tests | ⬜ TODO | `integration/` | E2E tests - future work |
 
 ## Progress Log
 
-### 2025-12-06
+### 2025-12-06 (Session 2)
+
+- **Implemented Phase 5**: Modified `pkg/ingester/ingester.go` to conditionally skip Kafka reader when `kafka.enabled: false`
+- **Implemented Phase 7 (partial)**: Added unit tests
+  - Added `TestConfig_Validate` test cases for WritePercentage, PartitionIsolationEnabled, KafkaDisabled
+  - Added `TestApplyStrictQuorum` test for read path quorum calculation
+  - Added `TestDistributor_usePartitionRouting` test for percentage-based routing logic
+
+### 2025-12-06 (Session 1)
 
 - Created `design.md` with full implementation design
 - Created `plans.md` for tracking progress
@@ -102,6 +110,21 @@ This document tracks the implementation progress of the partition ring without K
    - Added `applyStrictQuorum()` helper for stricter read quorum when Kafka is disabled
    - Modified `getIngesterReplicationSetsForQuery()` to use `partition_isolation_enabled`
 
+4. **`pkg/ingester/ingester.go`**:
+   - Added conditional Kafka reader initialization: skip when `kafka.enabled: false`
+   - Partition ring setup still runs regardless of Kafka setting
+
+5. **`pkg/storage/ingest/config_test.go`**:
+   - Added tests for WritePercentage validation (0, 50, 100, negative, >100)
+   - Added tests for PartitionIsolationEnabled requiring WritePercentage=100
+   - Added tests for Kafka disabled with/without address configured
+
+6. **`pkg/distributor/query_test.go`**:
+   - Added `TestApplyStrictQuorum` with tests for 1, 2, 3, 4, 5 zones
+
+7. **`pkg/distributor/distributor_test.go`**:
+   - Added `TestDistributor_usePartitionRouting` with comprehensive hash/percentage tests
+
 ### New Files Created
 
 1. **`design.md`**: Full implementation design document
@@ -110,8 +133,7 @@ This document tracks the implementation progress of the partition ring without K
 
 ## Next Steps (Future Work)
 
-1. Implement Kafka reader skip in ingester when `kafka.enabled: false`
-2. Add comprehensive unit tests for all new functionality
-3. Add integration tests for the migration flow
-4. Add additional metrics (partition health, latency)
-5. Test the full migration path from classic to partition routing
+1. Add write path quorum tests (complex - requires mocking)
+2. Add integration tests for the migration flow
+3. Add additional metrics (partition health, latency)
+4. Test the full migration path from classic to partition routing

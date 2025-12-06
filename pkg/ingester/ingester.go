@@ -491,18 +491,25 @@ func New(cfg Config, limits *validation.Overrides, ingestersRing ring.ReadRing, 
 			return nil, errors.Wrap(err, "calculating ingester partition ID")
 		}
 
-		// We use the ingester instance ID as consumer group. This means that we have N consumer groups
-		// where N is the total number of ingesters. Each ingester is part of their own consumer group
-		// so that they all replay the owned partition with no gaps.
-		kafkaCfg.FallbackClientErrorSampleRate = cfg.ErrorSampleRate
+		// Only create the Kafka reader when Kafka is enabled.
+		// When kafka.enabled: false, writes come directly from distributors via Push(),
+		// so there's no need to consume from Kafka.
+		if kafkaCfg.Enabled {
+			// We use the ingester instance ID as consumer group. This means that we have N consumer groups
+			// where N is the total number of ingesters. Each ingester is part of their own consumer group
+			// so that they all replay the owned partition with no gaps.
+			kafkaCfg.FallbackClientErrorSampleRate = cfg.ErrorSampleRate
 
-		// This is injected already higher up for methods invoked via the network.
-		// Here we use it so that pushes from kafka also get a tenant assigned since the PartitionReader invokes the ingester.
-		profilingIngester := NewIngesterProfilingWrapper(i)
+			// This is injected already higher up for methods invoked via the network.
+			// Here we use it so that pushes from kafka also get a tenant assigned since the PartitionReader invokes the ingester.
+			profilingIngester := NewIngesterProfilingWrapper(i)
 
-		i.ingestReader, err = ingest.NewPartitionReaderForPusher(kafkaCfg, i.ingestPartitionID, cfg.IngesterRing.InstanceID, profilingIngester, log.With(logger, "component", "ingest_reader"), registerer)
-		if err != nil {
-			return nil, errors.Wrap(err, "creating ingest storage reader")
+			i.ingestReader, err = ingest.NewPartitionReaderForPusher(kafkaCfg, i.ingestPartitionID, cfg.IngesterRing.InstanceID, profilingIngester, log.With(logger, "component", "ingest_reader"), registerer)
+			if err != nil {
+				return nil, errors.Wrap(err, "creating ingest storage reader")
+			}
+		} else {
+			level.Info(logger).Log("msg", "Kafka reader disabled, writes will come directly from distributors")
 		}
 
 		partitionRingKV := cfg.IngesterPartitionRing.KVStore.Mock

@@ -255,6 +255,91 @@ func TestConfig_Validate(t *testing.T) {
 
 			expectedErr: ErrInvalidWriteLogsFsyncConcurrency,
 		},
+		"should fail if write percentage is negative": {
+			setup: func(cfg *Config) {
+				cfg.Enabled = true
+				cfg.KafkaConfig.Address = "localhost"
+				cfg.KafkaConfig.Topic = "test"
+				cfg.Migration.WritePercentage = -1
+			},
+			expectedErr: ErrInvalidWritePercentage,
+		},
+		"should fail if write percentage is greater than 100": {
+			setup: func(cfg *Config) {
+				cfg.Enabled = true
+				cfg.KafkaConfig.Address = "localhost"
+				cfg.KafkaConfig.Topic = "test"
+				cfg.Migration.WritePercentage = 101
+			},
+			expectedErr: ErrInvalidWritePercentage,
+		},
+		"should pass if write percentage is 0": {
+			setup: func(cfg *Config) {
+				cfg.Enabled = true
+				cfg.KafkaConfig.Address = "localhost"
+				cfg.KafkaConfig.Topic = "test"
+				cfg.Migration.WritePercentage = 0
+			},
+		},
+		"should pass if write percentage is 50": {
+			setup: func(cfg *Config) {
+				cfg.Enabled = true
+				cfg.KafkaConfig.Address = "localhost"
+				cfg.KafkaConfig.Topic = "test"
+				cfg.Migration.WritePercentage = 50
+			},
+		},
+		"should pass if write percentage is 100": {
+			setup: func(cfg *Config) {
+				cfg.Enabled = true
+				cfg.KafkaConfig.Address = "localhost"
+				cfg.KafkaConfig.Topic = "test"
+				cfg.Migration.WritePercentage = 100
+			},
+		},
+		"should fail if partition isolation enabled but write percentage is less than 100": {
+			setup: func(cfg *Config) {
+				cfg.Enabled = true
+				cfg.KafkaConfig.Address = "localhost"
+				cfg.KafkaConfig.Topic = "test"
+				cfg.PartitionIsolationEnabled = true
+				cfg.Migration.WritePercentage = 50
+			},
+			expectedErr: ErrPartitionIsolationRequiresFull,
+		},
+		"should pass if partition isolation enabled and write percentage is 100": {
+			setup: func(cfg *Config) {
+				cfg.Enabled = true
+				cfg.KafkaConfig.Address = "localhost"
+				cfg.KafkaConfig.Topic = "test"
+				cfg.PartitionIsolationEnabled = true
+				cfg.Migration.WritePercentage = 100
+			},
+		},
+		"should fail if kafka is disabled but address is configured": {
+			setup: func(cfg *Config) {
+				cfg.Enabled = true
+				cfg.KafkaConfig.Enabled = false
+				cfg.KafkaConfig.Address = "localhost"
+			},
+			expectedErr: ErrKafkaAddressWithKafkaDisabled,
+		},
+		"should pass if kafka is disabled and address is empty": {
+			setup: func(cfg *Config) {
+				cfg.Enabled = true
+				cfg.KafkaConfig.Enabled = false
+				cfg.KafkaConfig.Address = ""
+			},
+		},
+		"should pass if kafka is disabled with partition isolation and write percentage 100": {
+			setup: func(cfg *Config) {
+				cfg.Enabled = true
+				cfg.KafkaConfig.Enabled = false
+				cfg.KafkaConfig.Address = ""
+				cfg.PartitionIsolationEnabled = true
+				cfg.Migration.WritePercentage = 100
+			},
+		},
 	}
 
 	for testName, testData := range tests {
