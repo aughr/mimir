@@ -762,7 +762,9 @@ func New(cfg Config, clientConfig ingester_client.Config, limits *validation.Ove
 		))
 	}
 
-	if cfg.IngestStorageConfig.Enabled {
+	// Only create Kafka writer if both ingest storage and Kafka are enabled.
+	// When Kafka is disabled, writes go directly to partition owners via writeToPartitionOwners().
+	if cfg.IngestStorageConfig.Enabled && cfg.IngestStorageConfig.KafkaConfig.Enabled {
 		d.ingestStorageWriter = ingest.NewWriter(d.cfg.IngestStorageConfig.KafkaConfig, log, reg)
 		subservices = append(subservices, d.ingestStorageWriter)
 	}
@@ -2486,8 +2488,9 @@ func (d *Distributor) writeToPartitionOwners(ctx context.Context, partitionID in
 	instances := make([]ring.InstanceDesc, 0, len(ownerIDs))
 	healthyZones := make(map[string]bool)
 
+	instanceRing := d.partitionsRing.InstanceRing()
 	for _, ownerID := range ownerIDs {
-		instance, err := d.ingestersRing.GetInstance(ownerID)
+		instance, err := instanceRing.GetInstance(ownerID)
 		if err != nil {
 			// Owner not in ingester ring, skip (could be removed due to crash).
 			continue
@@ -2506,7 +2509,7 @@ func (d *Distributor) writeToPartitionOwners(ctx context.Context, partitionID in
 	// This is important for quorum calculation.
 	allZones := make(map[string]bool)
 	for _, ownerID := range ownerIDs {
-		instance, err := d.ingestersRing.GetInstance(ownerID)
+		instance, err := instanceRing.GetInstance(ownerID)
 		if err != nil {
 			continue
 		}
@@ -2595,6 +2598,7 @@ func (d *Distributor) updatePartitionMetrics() {
 
 	now := time.Now()
 	partitions := partitionRing.Partitions()
+	instanceRing := d.partitionsRing.InstanceRing()
 
 	for _, partition := range partitions {
 		partitionIDStr := strconv.Itoa(int(partition.Id))
@@ -2606,7 +2610,7 @@ func (d *Distributor) updatePartitionMetrics() {
 		ownerIDs := partitionRing.PartitionOwnerIDs(partition.Id)
 		healthyCount := 0
 		for _, ownerID := range ownerIDs {
-			instance, err := d.ingestersRing.GetInstance(ownerID)
+			instance, err := instanceRing.GetInstance(ownerID)
 			if err != nil {
 				continue
 			}

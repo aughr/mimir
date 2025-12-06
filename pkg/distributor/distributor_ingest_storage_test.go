@@ -1734,9 +1734,11 @@ func TestDistributor_Push_WriteToPartitionOwners(t *testing.T) {
 		"should fail when one zone is unhealthy in 2-zone setup (no quorum)": {
 			ingesterStateByZone: map[string]ingesterZoneState{
 				"zone-a": {numIngesters: 1, happyIngesters: 1},
-				"zone-b": {numIngesters: 1, happyIngesters: 0}, // Unhappy
+				"zone-b": {numIngesters: 1, happyIngesters: 0}, // Unhappy - will fail on push
 			},
-			expectedErr: fmt.Errorf("at least 2 live replicas required"),
+			// With 2 zones and quorum requirement of 2, failure to push to one zone
+			// results in not meeting quorum, causing the overall push to fail.
+			expectedErr: fmt.Errorf("failed pushing to ingester"),
 		},
 		"should succeed when one zone is unhealthy in 3-zone setup (still has quorum)": {
 			ingesterStateByZone: map[string]ingesterZoneState{
