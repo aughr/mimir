@@ -64,9 +64,17 @@ This document tracks the implementation progress of the partition ring without K
 | Read path quorum tests (`applyStrictQuorum`) | ✅ DONE | `pkg/distributor/query_test.go` | Added `TestApplyStrictQuorum` |
 | Migration routing tests (`usePartitionRouting`) | ✅ DONE | `pkg/distributor/distributor_test.go` | Added `TestDistributor_usePartitionRouting` |
 | Config validation tests | ✅ DONE | `pkg/storage/ingest/config_test.go` | Added tests for WritePercentage, PartitionIsolationEnabled, KafkaDisabled |
-| Integration tests | ⬜ TODO | `integration/` | E2E tests - future work |
+| Integration tests | ✅ DONE | `integration/partition_ring_without_kafka_test.go` | E2E tests for partition ring without Kafka |
 
 ## Progress Log
+
+### 2025-12-06 (Session 3)
+
+- **Completed Phase 7**: Added integration tests for partition ring without Kafka
+  - Added `PartitionRingWithoutKafkaFlags` config helper to `integration/configs.go`
+  - Added `TestPartitionRingWithoutKafka` - basic write/read test with partition ring
+  - Added `TestPartitionRingWithoutKafkaZoneFailure` - zone failure tolerance test
+  - Added `TestPartitionRingWithoutKafkaMigration` - migration from classic ring test
 
 ### 2025-12-06 (Session 2)
 
@@ -130,13 +138,27 @@ This document tracks the implementation progress of the partition ring without K
 8. **`pkg/distributor/distributor_ingest_storage_test.go`**:
    - Added `TestDistributor_Push_WriteToPartitionOwners` with zone-aware quorum tests
 
+9. **`integration/configs.go`**:
+   - Added `PartitionRingWithoutKafkaFlags` function for configuring partition ring without Kafka
+
+10. **`integration/partition_ring_without_kafka_test.go`**:
+    - Added `TestPartitionRingWithoutKafka` - basic write/read test
+    - Added `TestPartitionRingWithoutKafkaZoneFailure` - zone failure tolerance test
+    - Added `TestPartitionRingWithoutKafkaMigration` - migration from classic ring test
+
 ### New Files Created
 
 1. **`design.md`**: Full implementation design document
 2. **`plans.md`**: This file - implementation plan and progress tracking
 3. **`design_changes.md`**: For tracking any design changes (currently empty)
+4. **`integration/partition_ring_without_kafka_test.go`**: Integration tests for partition ring without Kafka
 
-## Next Steps (Future Work)
+## Implementation Complete
 
-1. Add integration tests for the migration flow
-2. Test the full migration path from classic to partition routing
+All phases of the partition ring without Kafka implementation have been completed:
+
+- Configuration changes for kafka.enabled, WritePercentage, and PartitionIsolationEnabled
+- Zone-aware quorum for writes and reads when Kafka is disabled
+- Migration support with percentage-based routing
+- Comprehensive unit tests and integration tests
+- Metrics for monitoring partition health and migration progress

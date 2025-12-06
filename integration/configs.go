@@ -275,6 +275,31 @@ blocks_storage:
 			"-ingest-storage.kafka.auto-create-topic-default-partitions": "10",
 		}
 	}
+
+	// PartitionRingWithoutKafkaFlags returns flags for enabling partition ring infrastructure
+	// without Kafka. This enables direct writes from distributors to ingesters using
+	// zone-aware quorum for fault tolerance.
+	PartitionRingWithoutKafkaFlags = func() map[string]string {
+		return map[string]string{
+			// Enable ingest storage but disable Kafka - this enables partition ring without Kafka
+			"-ingest-storage.enabled":       "true",
+			"-ingest-storage.kafka.enabled": "false",
+
+			// Configure for direct ingester writes (100% to partition owners)
+			"-ingest-storage.migration.write-percentage": "100",
+
+			// Enable partition isolation for reads
+			"-ingest-storage.partition-isolation-enabled": "true",
+
+			// Do not wait before switching an INACTIVE partition to ACTIVE.
+			"-ingester.partition-ring.min-partition-owners-count":    "0",
+			"-ingester.partition-ring.min-partition-owners-duration": "0s",
+
+			// Enable zone-aware replication in the ingester ring
+			"-ingester.ring.zone-awareness-enabled": "true",
+			"-ingester.ring.replication-factor":     "3",
+		}
+	}
 )
 
 func buildConfigFromTemplate(tmpl string, data interface{}) string {
