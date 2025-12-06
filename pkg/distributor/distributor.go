@@ -163,8 +163,9 @@ type Distributor struct {
 	hashCollisionCount               prometheus.Counter
 
 	// Metrics for partition ring writes (no-Kafka mode)
-	writePathRequests        *prometheus.CounterVec
-	migrationWritePercentage prometheus.Gauge
+	writePathRequests            *prometheus.CounterVec
+	migrationWritePercentage     prometheus.Gauge
+	partitionWriteLatencySeconds *prometheus.HistogramVec
 
 	// Metric for silently dropped native histogram samples
 	droppedNativeHistograms *prometheus.CounterVec
@@ -622,6 +623,11 @@ func New(cfg Config, clientConfig ingester_client.Config, limits *validation.Ove
 			Name: "cortex_distributor_migration_write_percentage",
 			Help: "Current migration write percentage setting.",
 		}),
+		partitionWriteLatencySeconds: promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "cortex_distributor_partition_write_latency_seconds",
+			Help:    "Latency of direct writes to partition owners (when Kafka is disabled).",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"partition"}),
 
 		PushMetrics: newPushMetrics(reg),
 		now:         defaultNow,
@@ -2512,6 +2518,7 @@ func (d *Distributor) writeToPartitionOwners(ctx context.Context, partitionID in
 	}
 
 	// Write to owners with quorum using the Do method.
+	startTime := time.Now()
 	_, err := replicationSet.Do(ctx, 0, func(ctx context.Context, ingester *ring.InstanceDesc) (any, error) {
 		client, err := d.ingesterPool.GetClientForInstance(*ingester)
 		if err != nil {
@@ -2529,6 +2536,7 @@ func (d *Distributor) writeToPartitionOwners(ctx context.Context, partitionID in
 
 		return nil, err
 	})
+	d.partitionWriteLatencySeconds.WithLabelValues(strconv.Itoa(int(partitionID))).Observe(time.Since(startTime).Seconds())
 
 	if err != nil {
 		return wrapPartitionPushError(err, partitionID)

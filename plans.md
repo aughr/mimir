@@ -51,9 +51,9 @@ This document tracks the implementation progress of the partition ring without K
 | Task | Status | File(s) | Notes |
 |------|--------|---------|-------|
 | Add `cortex_distributor_write_requests_total{path}` | ✅ DONE | `pkg/distributor/distributor.go` | path=classic|partition |
-| Add `cortex_distributor_partition_write_latency_seconds` | ⬜ TODO | N/A | Future work |
-| Add `cortex_partition_healthy_owners` | ⬜ TODO | N/A | Future work |
-| Add `cortex_partition_state` | ⬜ TODO | N/A | Future work |
+| Add `cortex_distributor_partition_write_latency_seconds` | ✅ DONE | `pkg/distributor/distributor.go` | Histogram of partition write latency |
+| Add `cortex_partition_healthy_owners` | ⬜ TODO | N/A | Future work - better tracked at ring level |
+| Add `cortex_partition_state` | ⬜ TODO | N/A | Future work - better tracked at ring level |
 | Add `cortex_distributor_migration_write_percentage` | ✅ DONE | `pkg/distributor/distributor.go` | Current setting |
 
 ### Phase 7: Tests
