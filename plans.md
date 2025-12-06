@@ -71,10 +71,12 @@ This document tracks the implementation progress of the partition ring without K
 ### 2025-12-06 (Session 2)
 
 - **Implemented Phase 5**: Modified `pkg/ingester/ingester.go` to conditionally skip Kafka reader when `kafka.enabled: false`
+- **Implemented Phase 6 (continued)**: Added `cortex_distributor_partition_write_latency_seconds` histogram metric
 - **Implemented Phase 7 (partial)**: Added unit tests
   - Added `TestConfig_Validate` test cases for WritePercentage, PartitionIsolationEnabled, KafkaDisabled
   - Added `TestApplyStrictQuorum` test for read path quorum calculation
   - Added `TestDistributor_usePartitionRouting` test for percentage-based routing logic
+  - Added `TestDistributor_Push_WriteToPartitionOwners` test for direct ingester writes with zone-aware quorum
 
 ### 2025-12-06 (Session 1)
 
@@ -104,7 +106,7 @@ This document tracks the implementation progress of the partition ring without K
    - Added `sendWriteRequestWithPercentageSplit()` for split routing during migration
    - Modified `sendWriteRequestToPartitions()` to conditionally use Kafka or direct writes
    - Modified `push()` to handle WritePercentage-based migration
-   - Added metrics: `writePathRequests`, `migrationWritePercentage`
+   - Added metrics: `writePathRequests`, `migrationWritePercentage`, `partitionWriteLatencySeconds`
 
 3. **`pkg/distributor/query.go`**:
    - Added `applyStrictQuorum()` helper for stricter read quorum when Kafka is disabled
@@ -137,5 +139,5 @@ This document tracks the implementation progress of the partition ring without K
 ## Next Steps (Future Work)
 
 1. Add integration tests for the migration flow
-2. Add additional metrics (partition health, latency)
+2. Add partition-level metrics at ring level (`cortex_partition_healthy_owners`, `cortex_partition_state`)
 3. Test the full migration path from classic to partition routing
