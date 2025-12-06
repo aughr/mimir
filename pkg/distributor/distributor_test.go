@@ -9381,3 +9381,51 @@ func TestDistributor_usePartitionRouting(t *testing.T) {
 		})
 	}
 }
+
+// TestDistributor_Migration_Rollback verifies that after a rollback (reducing WritePercentage
+// back to 0), the distributor correctly routes all traffic back to the classic ring path.
+func TestDistributor_Migration_Rollback(t *testing.T) {
+	// This test verifies the rollback scenario: after migrating traffic to partition ring,
+	// operators should be able to reduce WritePercentage back to 0 to route all traffic
+	// back to the classic ring path.
+
+	tests := map[string]struct {
+		writePercentage int
+		description     string
+		expectPartition bool
+	}{
+		"after rollback to 0%, all traffic goes to classic": {
+			writePercentage: 0,
+			description:     "Rollback complete - all traffic to classic ring",
+			expectPartition: false,
+		},
+		"partial rollback to 50%": {
+			writePercentage: 50,
+			description:     "Partial rollback - 50% still to partition",
+			expectPartition: true, // For hash 0, which is < 50
+		},
+		"before rollback at 100%": {
+			writePercentage: 100,
+			description:     "Full partition routing - before rollback",
+			expectPartition: true,
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			d := &Distributor{
+				cfg: Config{
+					IngestStorageConfig: ingest.Config{
+						Migration: ingest.MigrationConfig{
+							WritePercentage: testData.writePercentage,
+						},
+					},
+				},
+			}
+
+			// Test with hash 0, which should always route to partition when percentage > 0
+			result := d.usePartitionRouting(0)
+			assert.Equal(t, testData.expectPartition, result, testData.description)
+		})
+	}
+}

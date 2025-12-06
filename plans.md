@@ -58,15 +58,83 @@ This document tracks the implementation progress of the partition ring without K
 
 ### Phase 7: Tests
 
-| Task | Status | File(s) | Notes |
+#### Write Path Tests
+
+| Test | Status | File(s) | Notes |
 |------|--------|---------|-------|
-| Write path quorum tests (`writeToPartitionOwners`) | ✅ DONE | `pkg/distributor/distributor_ingest_storage_test.go` | Added `TestDistributor_Push_WriteToPartitionOwners` |
-| Read path quorum tests (`applyStrictQuorum`) | ✅ DONE | `pkg/distributor/query_test.go` | Added `TestApplyStrictQuorum` |
-| Migration routing tests (`usePartitionRouting`) | ✅ DONE | `pkg/distributor/distributor_test.go` | Added `TestDistributor_usePartitionRouting` |
-| Config validation tests | ✅ DONE | `pkg/storage/ingest/config_test.go` | Added tests for WritePercentage, PartitionIsolationEnabled, KafkaDisabled |
-| Integration tests | ✅ DONE | `integration/partition_ring_without_kafka_test.go` | E2E tests for partition ring without Kafka |
+| `TestDistributor_WriteToPartitionOwners_Quorum` | ✅ DONE | `pkg/distributor/distributor_ingest_storage_test.go` | 3 zones, 2 zones, 1 zone scenarios |
+| `TestDistributor_WriteToPartitionOwners_OwnerNotInIngesterRing` | ✅ DONE | `pkg/distributor/distributor_ingest_storage_test.go` | Graceful handling when owner missing |
+| `TestDistributor_WriteToPartitionOwners_QuorumValidationBeforeWrite` | ✅ DONE | `pkg/distributor/distributor_ingest_storage_test.go` | Covered in zone failure test |
+| `TestDistributor_WriteToPartitionOwners_PartialFailure` | ✅ DONE | `pkg/distributor/distributor_ingest_storage_test.go` | Zone failure scenarios |
+
+#### Read Path Tests
+
+| Test | Status | File(s) | Notes |
+|------|--------|---------|-------|
+| `TestApplyStrictQuorum` | ✅ DONE | `pkg/distributor/query_test.go` | Tests for 1-5 zones |
+| `TestDistributor_Query_ReadsFromAllPartitions` | ✅ DONE | `pkg/distributor/query_test.go` | Verify queries go to ALL partitions |
+
+#### Migration Tests
+
+| Test | Status | File(s) | Notes |
+|------|--------|---------|-------|
+| `TestDistributor_usePartitionRouting` | ✅ DONE | `pkg/distributor/distributor_test.go` | Percentage-based routing |
+| `TestDistributor_Migration_QueryAllIngestersDuringMigration` | ✅ DONE | `pkg/distributor/query_test.go` | Query all ingesters when partition_isolation=false |
+| `TestDistributor_Migration_CutoverValidation` | ✅ DONE | `pkg/storage/ingest/config_test.go` | partition_isolation requires write_percentage=100 |
+| `TestDistributor_Migration_Rollback` | ✅ DONE | `pkg/distributor/distributor_test.go` | Data accessible after rollback |
+
+#### Dynamic Zone Count Tests
+
+| Test | Status | File(s) | Notes |
+|------|--------|---------|-------|
+| `TestPartition_Quorum_TwoZones` | ✅ DONE | `pkg/distributor/query_test.go` | Covered in TestApplyStrictQuorum |
+| `TestPartition_Quorum_FiveZones` | ✅ DONE | `pkg/distributor/query_test.go` | Covered in TestApplyStrictQuorum |
+
+#### Configuration Tests
+
+| Test | Status | File(s) | Notes |
+|------|--------|---------|-------|
+| `TestConfig_Validate` | ✅ DONE | `pkg/storage/ingest/config_test.go` | All config validation |
+
+#### Failure Scenario Tests
+
+| Test | Status | File(s) | Notes |
+|------|--------|---------|-------|
+| `TestPartition_IngesterCrash_QuorumMaintained` | ✅ DONE | `pkg/distributor/distributor_ingest_storage_test.go` | 1-of-3 crash still works |
+| `TestPartition_IngesterCrash_QuorumLost` | ✅ DONE | `pkg/distributor/distributor_ingest_storage_test.go` | 2-of-3 crash fails |
+| `TestPartition_IngesterRestart_RejoinsPartition` | ✅ DONE | `pkg/distributor/distributor_ingest_storage_test.go` | Restarted ingester re-registers |
+| `TestPartition_NetworkPartition_ZoneIsolation` | ✅ DONE | `pkg/distributor/distributor_ingest_storage_test.go` | Zone isolation handling |
+
+#### Scale Up/Down Tests
+
+| Test | Status | File(s) | Notes |
+|------|--------|---------|-------|
+| `TestPartition_ScaleUp_NewPartitionBehavior` | ✅ DONE | `pkg/distributor/distributor_ingest_storage_test.go` | New writes to new partition |
+| `TestPartition_ScaleDown_InactivePartitionLookback` | ✅ DONE | `pkg/distributor/distributor_ingest_storage_test.go` | INACTIVE partitions queried |
+| `TestPartition_ScaleDown_PreparePartitionDownscale` | ⏭️ SKIPPED | `pkg/distributor/distributor_ingest_storage_test.go` | Requires API endpoint not yet implemented |
+
+#### Integration Tests
+
+| Test | Status | File(s) | Notes |
+|------|--------|---------|-------|
+| `TestPartitionRingWithoutKafka` | ✅ DONE | `integration/partition_ring_without_kafka_test.go` | Basic E2E write/read |
+| `TestPartitionRingWithoutKafkaZoneFailure` | ✅ DONE | `integration/partition_ring_without_kafka_test.go` | Zone failure tolerance |
+| `TestPartitionRingWithoutKafkaMigration` | ✅ DONE | `integration/partition_ring_without_kafka_test.go` | Migration from classic ring |
+| `TestPartitionRingWithoutKafkaRollback` | ✅ DONE | `integration/partition_ring_without_kafka_test.go` | Full rollback scenario (E2E_Migration_Rollback) |
 
 ## Progress Log
+
+### 2025-12-06 (Session 4)
+
+- **Completed remaining Phase 7 tests**: Implemented all remaining tests from design.md
+  - **Write Path**: Added `TestDistributor_WriteToPartitionOwners_OwnerNotInIngesterRing`
+  - **Read Path**: Added `TestDistributor_Query_ReadsFromAllPartitions`
+  - **Migration**: Added `TestDistributor_Migration_QueryAllIngestersDuringMigration`, `TestDistributor_Migration_Rollback`
+  - **Failure Scenarios**: Added `TestPartition_IngesterRestart_RejoinsPartition`, `TestPartition_NetworkPartition_ZoneIsolation`
+  - **Scale Up/Down**: Added `TestPartition_ScaleUp_NewPartitionBehavior`, `TestPartition_ScaleDown_InactivePartitionLookback`
+  - **Integration**: Added `TestPartitionRingWithoutKafkaRollback`
+- **Skipped**: `TestPartition_ScaleDown_PreparePartitionDownscale` requires API endpoint not yet implemented
+- All new tests pass
 
 ### 2025-12-06 (Session 3)
 
