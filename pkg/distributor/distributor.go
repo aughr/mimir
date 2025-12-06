@@ -166,6 +166,8 @@ type Distributor struct {
 	writePathRequests            *prometheus.CounterVec
 	migrationWritePercentage     prometheus.Gauge
 	partitionWriteLatencySeconds *prometheus.HistogramVec
+	partitionHealthyOwners       *prometheus.GaugeVec
+	partitionState               *prometheus.GaugeVec
 
 	// Metric for silently dropped native histogram samples
 	droppedNativeHistograms *prometheus.CounterVec
@@ -628,6 +630,14 @@ func New(cfg Config, clientConfig ingester_client.Config, limits *validation.Ove
 			Help:    "Latency of direct writes to partition owners (when Kafka is disabled).",
 			Buckets: prometheus.DefBuckets,
 		}, []string{"partition"}),
+		partitionHealthyOwners: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
+			Name: "cortex_partition_healthy_owners",
+			Help: "Number of healthy owners for each partition.",
+		}, []string{"partition"}),
+		partitionState: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
+			Name: "cortex_partition_state",
+			Help: "Current state of each partition (1=pending, 2=active, 3=inactive).",
+		}, []string{"partition"}),
 
 		PushMetrics: newPushMetrics(reg),
 		now:         defaultNow,
@@ -858,6 +868,16 @@ func (d *Distributor) running(ctx context.Context) error {
 	ingestionRateTicker := time.NewTicker(instanceIngestionRateTickInterval)
 	defer ingestionRateTicker.Stop()
 
+	// Update partition metrics every 15 seconds if ingest storage is enabled
+	var partitionMetricsChan <-chan time.Time
+	if d.cfg.IngestStorageConfig.Enabled && d.partitionsRing != nil {
+		partitionMetricsTicker := time.NewTicker(15 * time.Second)
+		defer partitionMetricsTicker.Stop()
+		partitionMetricsChan = partitionMetricsTicker.C
+		// Initial update
+		d.updatePartitionMetrics()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -865,6 +885,9 @@ func (d *Distributor) running(ctx context.Context) error {
 
 		case <-ingestionRateTicker.C:
 			d.ingestionRate.Tick()
+
+		case <-partitionMetricsChan:
+			d.updatePartitionMetrics()
 
 		case err := <-d.subservicesWatcher.Chan():
 			return errors.Wrap(err, "distributor subservice failed")
@@ -2556,6 +2579,43 @@ func (d *Distributor) usePartitionRouting(hash uint32) bool {
 		return true
 	}
 	return (hash % 100) < uint32(pct)
+}
+
+// updatePartitionMetrics updates the partition-related metrics (healthy owners and state).
+// This should be called periodically to keep metrics up to date.
+func (d *Distributor) updatePartitionMetrics() {
+	if d.partitionsRing == nil {
+		return
+	}
+
+	partitionRing := d.partitionsRing.PartitionRing()
+	if partitionRing == nil {
+		return
+	}
+
+	now := time.Now()
+	partitions := partitionRing.Partitions()
+
+	for _, partition := range partitions {
+		partitionIDStr := strconv.Itoa(int(partition.Id))
+
+		// Update partition state metric
+		d.partitionState.WithLabelValues(partitionIDStr).Set(float64(partition.State))
+
+		// Count healthy owners for this partition
+		ownerIDs := partitionRing.PartitionOwnerIDs(partition.Id)
+		healthyCount := 0
+		for _, ownerID := range ownerIDs {
+			instance, err := d.ingestersRing.GetInstance(ownerID)
+			if err != nil {
+				continue
+			}
+			if instance.IsHealthy(ring.Write, d.cfg.PoolConfig.RemoteTimeout, now) {
+				healthyCount++
+			}
+		}
+		d.partitionHealthyOwners.WithLabelValues(partitionIDStr).Set(float64(healthyCount))
+	}
 }
 
 // getSeriesAndMetadataTokens returns a slice of tokens for the series and metadata from the request in this specific order.

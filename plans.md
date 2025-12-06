@@ -52,8 +52,8 @@ This document tracks the implementation progress of the partition ring without K
 |------|--------|---------|-------|
 | Add `cortex_distributor_write_requests_total{path}` | ✅ DONE | `pkg/distributor/distributor.go` | path=classic|partition |
 | Add `cortex_distributor_partition_write_latency_seconds` | ✅ DONE | `pkg/distributor/distributor.go` | Histogram of partition write latency |
-| Add `cortex_partition_healthy_owners` | ⬜ TODO | N/A | Future work - better tracked at ring level |
-| Add `cortex_partition_state` | ⬜ TODO | N/A | Future work - better tracked at ring level |
+| Add `cortex_partition_healthy_owners` | ✅ DONE | `pkg/distributor/distributor.go` | GaugeVec per partition, updated every 15s |
+| Add `cortex_partition_state` | ✅ DONE | `pkg/distributor/distributor.go` | GaugeVec per partition, updated every 15s |
 | Add `cortex_distributor_migration_write_percentage` | ✅ DONE | `pkg/distributor/distributor.go` | Current setting |
 
 ### Phase 7: Tests
@@ -139,5 +139,4 @@ This document tracks the implementation progress of the partition ring without K
 ## Next Steps (Future Work)
 
 1. Add integration tests for the migration flow
-2. Add partition-level metrics at ring level (`cortex_partition_healthy_owners`, `cortex_partition_state`)
-3. Test the full migration path from classic to partition routing
+2. Test the full migration path from classic to partition routing
