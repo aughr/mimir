@@ -2505,32 +2505,18 @@ func (d *Distributor) writeToPartitionOwners(ctx context.Context, partitionID in
 		healthyZones[instance.Zone] = true
 	}
 
-	// Count unique zones from all registered owners (not just healthy ones) to determine expected zone count.
-	// This is important for quorum calculation.
-	allZones := make(map[string]bool)
-	for _, ownerID := range ownerIDs {
-		instance, err := instanceRing.GetInstance(ownerID)
-		if err != nil {
-			continue
-		}
-		allZones[instance.Zone] = true
-	}
-
-	expectedZones := len(allZones)
-	if expectedZones == 0 {
-		return fmt.Errorf("partition %d: no zones found for partition owners", partitionID)
-	}
-
-	// Calculate minimum required zones for quorum: (expectedZones / 2) + 1
-	// For 3 zones: need 2
-	// For 5 zones: need 3
-	minRequiredZones := (expectedZones / 2) + 1
+	// Use ReplicationFactor as the expected zone count.
+	// This matches classic ring behavior where RF = number of zones.
+	// During cold start, writes are rejected until quorum zones are available.
+	replicationFactor := d.ingestersRing.ReplicationFactor()
+	minRequiredZones := (replicationFactor / 2) + 1
 	numHealthyZones := len(healthyZones)
 
 	// Validate we have enough healthy zones BEFORE attempting writes.
+	// This will reject writes during cold start until enough zones are up.
 	if numHealthyZones < minRequiredZones {
 		return fmt.Errorf("partition %d: insufficient healthy zones for quorum (have %d, need %d of %d)",
-			partitionID, numHealthyZones, minRequiredZones, expectedZones)
+			partitionID, numHealthyZones, minRequiredZones, replicationFactor)
 	}
 
 	// Build ReplicationSet with zone-aware quorum.

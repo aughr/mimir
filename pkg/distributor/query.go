@@ -142,8 +142,9 @@ func (d *Distributor) getIngesterReplicationSetsForQuery(ctx context.Context) ([
 		// Reads must query 2 of 3 zones (or quorum of N zones) because without Kafka
 		// there's no guarantee all partition owners have the same data.
 		if !d.cfg.IngestStorageConfig.KafkaConfig.Enabled {
+			replicationFactor := d.ingestersRing.ReplicationFactor()
 			for i := range replicationSets {
-				replicationSets[i] = applyStrictQuorum(replicationSets[i])
+				replicationSets[i] = applyStrictQuorum(replicationSets[i], replicationFactor)
 			}
 		}
 
@@ -167,26 +168,20 @@ func (d *Distributor) getIngesterReplicationSetsForQuery(ctx context.Context) ([
 
 // applyStrictQuorum adjusts the MaxUnavailableZones in a ReplicationSet to use quorum semantics.
 // This is used when Kafka is disabled to ensure reads query 2 of 3 zones (or quorum of N zones).
-// Formula: MaxUnavailableZones = uniqueZones - ((uniqueZones / 2) + 1)
-// With 3 zones: 3 - (3/2 + 1) = 3 - 2 = 1 → need 2 zones
-// With 5 zones: 5 - (5/2 + 1) = 5 - 3 = 2 → need 3 zones
-func applyStrictQuorum(rs ring.ReplicationSet) ring.ReplicationSet {
-	// Count unique zones in the replication set.
-	zones := make(map[string]struct{})
-	for _, instance := range rs.Instances {
-		zones[instance.Zone] = struct{}{}
-	}
-	uniqueZones := len(zones)
-
-	if uniqueZones <= 1 {
+// Uses ReplicationFactor as the expected zone count to match classic ring behavior.
+// Formula: MaxUnavailableZones = RF - ((RF / 2) + 1)
+// With RF=3: 3 - (3/2 + 1) = 3 - 2 = 1 → need 2 zones
+// With RF=5: 5 - (5/2 + 1) = 5 - 3 = 2 → need 3 zones
+func applyStrictQuorum(rs ring.ReplicationSet, replicationFactor int) ring.ReplicationSet {
+	if replicationFactor <= 1 {
 		// Single zone: no quorum possible, need all instances.
 		rs.MaxUnavailableZones = 0
 		return rs
 	}
 
-	// Calculate quorum: (zones / 2) + 1 zones must respond.
-	quorum := (uniqueZones / 2) + 1
-	rs.MaxUnavailableZones = uniqueZones - quorum
+	// Calculate quorum based on ReplicationFactor: (RF / 2) + 1 zones must respond.
+	quorum := (replicationFactor / 2) + 1
+	rs.MaxUnavailableZones = replicationFactor - quorum
 
 	return rs
 }

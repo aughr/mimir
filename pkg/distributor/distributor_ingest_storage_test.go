@@ -1725,11 +1725,13 @@ func TestDistributor_Push_WriteToPartitionOwners(t *testing.T) {
 			},
 			expectedPushedZones: 2, // Both zones required
 		},
-		"should successfully push to single zone": {
+		"should fail with single zone when RF=3 (cold start - need 2 zones for quorum)": {
 			ingesterStateByZone: map[string]ingesterZoneState{
 				"zone-a": {numIngesters: 1, happyIngesters: 1},
 			},
-			expectedPushedZones: 1,
+			// With RF=3 (default), quorum requires 2 zones. Single zone cannot achieve quorum.
+			// This is the expected cold-start behavior: writes rejected until enough zones are up.
+			expectedErr: fmt.Errorf("insufficient healthy zones for quorum (have 1, need 2 of 3)"),
 		},
 		"should fail when one zone is unhealthy in 2-zone setup (no quorum)": {
 			ingesterStateByZone: map[string]ingesterZoneState{

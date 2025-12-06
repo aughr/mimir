@@ -798,103 +798,59 @@ func (b byLabels) Swap(i, j int)      { b[i], b[j] = b[j], b[i] }
 func (b byLabels) Less(i, j int) bool { return labels.Compare(b[i], b[j]) < 0 }
 
 func TestApplyStrictQuorum(t *testing.T) {
+	// applyStrictQuorum now uses ReplicationFactor directly, not the zones from instances.
+	// This matches classic ring behavior where RF = expected zone count.
 	tests := map[string]struct {
-		instances               []ring.InstanceDesc
+		replicationFactor       int
 		expectedMaxUnavailable  int
 		expectedMinRequiredZone int
 	}{
-		"single zone with single instance": {
-			instances: []ring.InstanceDesc{
-				{Addr: "instance-1", Zone: "zone-a"},
-			},
+		"RF=1 - single zone, need all": {
+			replicationFactor:       1,
 			expectedMaxUnavailable:  0,
 			expectedMinRequiredZone: 1,
 		},
-		"single zone with multiple instances": {
-			instances: []ring.InstanceDesc{
-				{Addr: "instance-1", Zone: "zone-a"},
-				{Addr: "instance-2", Zone: "zone-a"},
-				{Addr: "instance-3", Zone: "zone-a"},
-			},
-			expectedMaxUnavailable:  0,
-			expectedMinRequiredZone: 1,
-		},
-		"two zones - need both (quorum is 2)": {
-			instances: []ring.InstanceDesc{
-				{Addr: "instance-1", Zone: "zone-a"},
-				{Addr: "instance-2", Zone: "zone-b"},
-			},
+		"RF=2 - need both (quorum is 2)": {
+			replicationFactor:       2,
 			expectedMaxUnavailable:  0, // 2 - (2/2 + 1) = 2 - 2 = 0
 			expectedMinRequiredZone: 2,
 		},
-		"three zones - need 2 of 3 (quorum is 2)": {
-			instances: []ring.InstanceDesc{
-				{Addr: "instance-1", Zone: "zone-a"},
-				{Addr: "instance-2", Zone: "zone-b"},
-				{Addr: "instance-3", Zone: "zone-c"},
-			},
+		"RF=3 - need 2 of 3 (quorum is 2)": {
+			replicationFactor:       3,
 			expectedMaxUnavailable:  1, // 3 - (3/2 + 1) = 3 - 2 = 1
 			expectedMinRequiredZone: 2,
 		},
-		"three zones with multiple instances per zone - need 2 of 3 (quorum is 2)": {
-			instances: []ring.InstanceDesc{
-				{Addr: "instance-1a", Zone: "zone-a"},
-				{Addr: "instance-1b", Zone: "zone-a"},
-				{Addr: "instance-2a", Zone: "zone-b"},
-				{Addr: "instance-2b", Zone: "zone-b"},
-				{Addr: "instance-3a", Zone: "zone-c"},
-				{Addr: "instance-3b", Zone: "zone-c"},
-			},
-			expectedMaxUnavailable:  1, // 3 - (3/2 + 1) = 3 - 2 = 1
-			expectedMinRequiredZone: 2,
-		},
-		"four zones - need 3 of 4 (quorum is 3)": {
-			instances: []ring.InstanceDesc{
-				{Addr: "instance-1", Zone: "zone-a"},
-				{Addr: "instance-2", Zone: "zone-b"},
-				{Addr: "instance-3", Zone: "zone-c"},
-				{Addr: "instance-4", Zone: "zone-d"},
-			},
+		"RF=4 - need 3 of 4 (quorum is 3)": {
+			replicationFactor:       4,
 			expectedMaxUnavailable:  1, // 4 - (4/2 + 1) = 4 - 3 = 1
 			expectedMinRequiredZone: 3,
 		},
-		"five zones - need 3 of 5 (quorum is 3)": {
-			instances: []ring.InstanceDesc{
-				{Addr: "instance-1", Zone: "zone-a"},
-				{Addr: "instance-2", Zone: "zone-b"},
-				{Addr: "instance-3", Zone: "zone-c"},
-				{Addr: "instance-4", Zone: "zone-d"},
-				{Addr: "instance-5", Zone: "zone-e"},
-			},
+		"RF=5 - need 3 of 5 (quorum is 3)": {
+			replicationFactor:       5,
 			expectedMaxUnavailable:  2, // 5 - (5/2 + 1) = 5 - 3 = 2
 			expectedMinRequiredZone: 3,
-		},
-		"empty instances": {
-			instances:               []ring.InstanceDesc{},
-			expectedMaxUnavailable:  0,
-			expectedMinRequiredZone: 0,
 		},
 	}
 
 	for testName, testData := range tests {
 		t.Run(testName, func(t *testing.T) {
+			// Instances don't affect quorum calculation anymore - RF does.
+			// Create some dummy instances for the ReplicationSet.
 			rs := ring.ReplicationSet{
-				Instances:            testData.instances,
+				Instances: []ring.InstanceDesc{
+					{Addr: "instance-1", Zone: "zone-a"},
+				},
 				MaxUnavailableZones:  100, // Set to high value to ensure it gets overwritten
 				ZoneAwarenessEnabled: true,
 			}
 
-			result := applyStrictQuorum(rs)
+			result := applyStrictQuorum(rs, testData.replicationFactor)
 
 			assert.Equal(t, testData.expectedMaxUnavailable, result.MaxUnavailableZones,
 				"MaxUnavailableZones mismatch")
 
-			// Verify the quorum calculation by checking min required zones
-			uniqueZones := make(map[string]struct{})
-			for _, inst := range testData.instances {
-				uniqueZones[inst.Zone] = struct{}{}
-			}
-			actualMinRequired := len(uniqueZones) - result.MaxUnavailableZones
+			// Verify the quorum calculation
+			actualMinRequired := testData.replicationFactor - result.MaxUnavailableZones
 			assert.Equal(t, testData.expectedMinRequiredZone, actualMinRequired,
 				"minimum required zones mismatch")
 		})
@@ -908,46 +864,39 @@ func TestDistributor_Query_ReadsFromAllPartitions(t *testing.T) {
 	// When partition isolation is enabled, queries should read from all active partitions.
 	// This test verifies the query path correctly fans out to all partitions.
 
-	// The applyStrictQuorum function adjusts the quorum requirements.
+	// The applyStrictQuorum function adjusts the quorum requirements based on RF.
 	// When partition isolation is enabled, getIngesterReplicationSetsForQuery should
-	// return replication sets for all partitions.
+	// return replication sets for all partitions with RF-based quorum.
 
-	// Test that strict quorum is correctly applied for various zone counts
+	// Test that strict quorum is correctly applied for various RF values
 	tests := map[string]struct {
-		numZones              int
+		replicationFactor     int
 		expectedMinZonesForOp int
 	}{
-		"3 zones requires 2 for quorum": {
-			numZones:              3,
+		"RF=3 requires 2 for quorum": {
+			replicationFactor:     3,
 			expectedMinZonesForOp: 2,
 		},
-		"5 zones requires 3 for quorum": {
-			numZones:              5,
+		"RF=5 requires 3 for quorum": {
+			replicationFactor:     5,
 			expectedMinZonesForOp: 3,
 		},
 	}
 
 	for testName, testData := range tests {
 		t.Run(testName, func(t *testing.T) {
-			// Create instances across zones
-			instances := make([]ring.InstanceDesc, testData.numZones)
-			for i := 0; i < testData.numZones; i++ {
-				instances[i] = ring.InstanceDesc{
-					Addr: fmt.Sprintf("instance-%d", i),
-					Zone: fmt.Sprintf("zone-%d", i),
-				}
-			}
-
 			rs := ring.ReplicationSet{
-				Instances:            instances,
-				MaxUnavailableZones:  testData.numZones, // Will be adjusted by applyStrictQuorum
+				Instances: []ring.InstanceDesc{
+					{Addr: "instance-1", Zone: "zone-a"},
+				},
+				MaxUnavailableZones:  testData.replicationFactor, // Will be adjusted by applyStrictQuorum
 				ZoneAwarenessEnabled: true,
 			}
 
-			result := applyStrictQuorum(rs)
+			result := applyStrictQuorum(rs, testData.replicationFactor)
 
 			// Verify the correct number of zones must respond
-			actualMinRequired := testData.numZones - result.MaxUnavailableZones
+			actualMinRequired := testData.replicationFactor - result.MaxUnavailableZones
 			assert.Equal(t, testData.expectedMinZonesForOp, actualMinRequired,
 				"expected %d zones required for quorum, got %d", testData.expectedMinZonesForOp, actualMinRequired)
 		})
@@ -963,19 +912,19 @@ func TestDistributor_Migration_QueryAllIngestersDuringMigration(t *testing.T) {
 	// Test the applyStrictQuorum behavior - it should only be used when partition isolation is enabled.
 	// When partition isolation is disabled, the classic ring path is used which doesn't need strict quorum.
 
-	// Verify quorum calculation for different zone configurations
+	// Verify quorum calculation for different RF configurations
 	tests := map[string]struct {
-		numZones                int
+		replicationFactor       int
 		partitionIsolation      bool
 		expectedMaxUnavailable  int
 	}{
 		"partition isolation enabled - strict quorum": {
-			numZones:               3,
+			replicationFactor:      3,
 			partitionIsolation:     true,
 			expectedMaxUnavailable: 1, // 3 - (3/2 + 1) = 3 - 2 = 1
 		},
 		"partition isolation disabled - classic ring semantics": {
-			numZones:               3,
+			replicationFactor:      3,
 			partitionIsolation:     false,
 			expectedMaxUnavailable: 100, // Not adjusted, uses original value
 		},
@@ -983,22 +932,16 @@ func TestDistributor_Migration_QueryAllIngestersDuringMigration(t *testing.T) {
 
 	for testName, testData := range tests {
 		t.Run(testName, func(t *testing.T) {
-			instances := make([]ring.InstanceDesc, testData.numZones)
-			for i := 0; i < testData.numZones; i++ {
-				instances[i] = ring.InstanceDesc{
-					Addr: fmt.Sprintf("instance-%d", i),
-					Zone: fmt.Sprintf("zone-%d", i),
-				}
-			}
-
 			rs := ring.ReplicationSet{
-				Instances:            instances,
+				Instances: []ring.InstanceDesc{
+					{Addr: "instance-1", Zone: "zone-a"},
+				},
 				MaxUnavailableZones:  100, // High value simulating classic ring
 				ZoneAwarenessEnabled: true,
 			}
 
 			if testData.partitionIsolation {
-				result := applyStrictQuorum(rs)
+				result := applyStrictQuorum(rs, testData.replicationFactor)
 				assert.Equal(t, testData.expectedMaxUnavailable, result.MaxUnavailableZones)
 			} else {
 				// When partition isolation is disabled, applyStrictQuorum shouldn't be called
