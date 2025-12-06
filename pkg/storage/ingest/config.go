@@ -38,6 +38,9 @@ var (
 	ErrInvalidFetchMaxWait               = errors.New("the Kafka fetch max wait must be between 5s and 30s")
 	ErrInvalidRecordVersion              = errors.New("invalid record format version")
 	ErrInvalidWriteLogsFsyncConcurrency  = errors.New("the configured number of tenants to fsync concurrently before Kafka offsets are committed must be at least 1")
+	ErrInvalidWritePercentage            = errors.New("the configured write percentage must be between 0 and 100")
+	ErrPartitionIsolationRequiresFull    = errors.New("partition_isolation_enabled requires write_percentage to be 100")
+	ErrKafkaAddressWithKafkaDisabled     = errors.New("kafka.address must be empty when kafka.enabled is false")
 
 	consumeFromPositionOptions = []string{consumeFromLastOffset, consumeFromStart, consumeFromEnd, consumeFromTimestamp}
 
@@ -53,11 +56,16 @@ type Config struct {
 	KafkaConfig KafkaConfig     `yaml:"kafka"`
 	Migration   MigrationConfig `yaml:"migration"`
 
+	// PartitionIsolationEnabled enables per-partition query routing and failure isolation.
+	// Only set to true after write_percentage is 100 and old classic-path data has aged out.
+	PartitionIsolationEnabled bool `yaml:"partition_isolation_enabled"`
+
 	WriteLogsFsyncBeforeKafkaCommitConcurrency int `yaml:"write_logs_fsync_before_kafka_commit_concurrency" category:"advanced"`
 }
 
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.Enabled, "ingest-storage.enabled", false, "True to enable the ingestion via object storage.")
+	f.BoolVar(&cfg.PartitionIsolationEnabled, "ingest-storage.partition-isolation-enabled", false, "When enabled, queries use per-partition routing and failure isolation. Only enable after write_percentage is 100 and old classic-path data has aged out (~2h).")
 	f.IntVar(&cfg.WriteLogsFsyncBeforeKafkaCommitConcurrency, "ingest-storage.write-logs-fsync-before-kafka-commit-concurrency", 4, "Number of tenants to concurrently fsync WAL and WBL before Kafka offsets are committed, must be at least 1.")
 
 	cfg.KafkaConfig.RegisterFlagsWithPrefix("ingest-storage.kafka.", f)
@@ -75,8 +83,26 @@ func (cfg *Config) Validate() error {
 		return fmt.Errorf("%w, is %d", ErrInvalidWriteLogsFsyncConcurrency, cfg.WriteLogsFsyncBeforeKafkaCommitConcurrency)
 	}
 
-	if err := cfg.KafkaConfig.Validate(); err != nil {
+	// Validate migration config
+	if err := cfg.Migration.Validate(); err != nil {
 		return err
+	}
+
+	// Validate partition isolation constraints
+	if cfg.PartitionIsolationEnabled && cfg.Migration.WritePercentage < 100 {
+		return ErrPartitionIsolationRequiresFull
+	}
+
+	// Validate Kafka config (but only if Kafka is enabled)
+	if cfg.KafkaConfig.Enabled {
+		if err := cfg.KafkaConfig.Validate(); err != nil {
+			return err
+		}
+	} else {
+		// When Kafka is disabled, address must be empty
+		if cfg.KafkaConfig.Address != "" {
+			return ErrKafkaAddressWithKafkaDisabled
+		}
 	}
 
 	return nil
@@ -84,6 +110,10 @@ func (cfg *Config) Validate() error {
 
 // KafkaConfig holds the generic config for the Kafka backend.
 type KafkaConfig struct {
+	// Enabled controls whether Kafka is used as the write backend.
+	// When false, writes go directly to partition owners (ingesters) instead of Kafka.
+	Enabled bool `yaml:"enabled"`
+
 	Address      string        `yaml:"address"`
 	Topic        string        `yaml:"topic"`
 	ClientID     string        `yaml:"client_id"`
@@ -157,6 +187,7 @@ func (cfg *KafkaConfig) RegisterFlags(f *flag.FlagSet) {
 func (cfg *KafkaConfig) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	cfg.concurrentFetchersFetchBackoffConfig = defaultFetchBackoffConfig
 
+	f.BoolVar(&cfg.Enabled, prefix+"enabled", true, "When true, use Kafka as the write backend. When false, write directly to partition owners (ingesters) without Kafka.")
 	f.StringVar(&cfg.Address, prefix+"address", "", "The Kafka backend address.")
 	f.StringVar(&cfg.Topic, prefix+"topic", "", "The Kafka topic name.")
 	f.StringVar(&cfg.ClientID, prefix+"client-id", "", "The Kafka client ID.")
@@ -289,6 +320,11 @@ type MigrationConfig struct {
 	DistributorSendToIngestersEnabled bool          `yaml:"distributor_send_to_ingesters_enabled"`
 	IgnoreIngestStorageErrors         bool          `yaml:"ignore_ingest_storage_errors"`
 	IngestStorageMaxWaitTime          time.Duration `yaml:"ingest_storage_max_wait_time"`
+
+	// WritePercentage controls what percentage of series use partition routing for writes (0-100).
+	// Series are routed based on hash: hash % 100 < WritePercentage → partition routing.
+	// Use this to gradually migrate from classic to partition routing.
+	WritePercentage int `yaml:"write_percentage"`
 }
 
 func (cfg *MigrationConfig) RegisterFlags(f *flag.FlagSet) {
@@ -299,4 +335,13 @@ func (cfg *MigrationConfig) RegisterFlagsWithPrefix(prefix string, f *flag.FlagS
 	f.BoolVar(&cfg.DistributorSendToIngestersEnabled, prefix+"distributor-send-to-ingesters-enabled", false, "When both this option and ingest storage are enabled, distributors write to both Kafka and ingesters. A write request is considered successful only when written to both backends.")
 	f.BoolVar(&cfg.IgnoreIngestStorageErrors, prefix+"ignore-ingest-storage-errors", false, "When enabled, errors writing to ingest storage are logged but do not affect write success or quorum. When disabled, write requests fail if ingest storage write fails.")
 	f.DurationVar(&cfg.IngestStorageMaxWaitTime, prefix+"ingest-storage-max-wait-time", 0, "The maximum time a write request that goes through the ingest storage waits before it times out. Set to `0` to disable the timeout.")
+	f.IntVar(&cfg.WritePercentage, prefix+"write-percentage", 0, "Percentage of series to route via partition ring (0-100). Series are routed based on hash: hash %% 100 < write_percentage → partition routing. Increase gradually: 0 → 10 → 25 → 50 → 100.")
+}
+
+// Validate validates the MigrationConfig.
+func (cfg *MigrationConfig) Validate() error {
+	if cfg.WritePercentage < 0 || cfg.WritePercentage > 100 {
+		return ErrInvalidWritePercentage
+	}
+	return nil
 }

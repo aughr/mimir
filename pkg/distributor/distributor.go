@@ -162,6 +162,10 @@ type Distributor struct {
 	latestSeenSampleTimestampPerUser *prometheus.GaugeVec
 	hashCollisionCount               prometheus.Counter
 
+	// Metrics for partition ring writes (no-Kafka mode)
+	writePathRequests        *prometheus.CounterVec
+	migrationWritePercentage prometheus.Gauge
+
 	// Metric for silently dropped native histogram samples
 	droppedNativeHistograms *prometheus.CounterVec
 
@@ -609,6 +613,16 @@ func New(cfg Config, clientConfig ingester_client.Config, limits *validation.Ove
 			Help: "Number of times a hash collision was detected when de-duplicating samples.",
 		}),
 
+		// Metrics for partition ring writes (no-Kafka mode)
+		writePathRequests: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "cortex_distributor_write_requests_total",
+			Help: "Total write requests by path (classic vs partition).",
+		}, []string{"path"}),
+		migrationWritePercentage: promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+			Name: "cortex_distributor_migration_write_percentage",
+			Help: "Current migration write percentage setting.",
+		}),
+
 		PushMetrics: newPushMetrics(reg),
 		now:         defaultNow,
 		sleep:       defaultSleep,
@@ -618,6 +632,11 @@ func New(cfg Config, clientConfig ingester_client.Config, limits *validation.Ove
 	d.rejectedRequests.WithLabelValues(reasonDistributorMaxIngestionRate)
 	d.rejectedRequests.WithLabelValues(reasonDistributorMaxInflightPushRequests)
 	d.rejectedRequests.WithLabelValues(reasonDistributorMaxInflightPushRequestsBytes)
+
+	// Initialize write path labels and set migration write percentage
+	d.writePathRequests.WithLabelValues("classic")
+	d.writePathRequests.WithLabelValues("partition")
+	d.migrationWritePercentage.Set(float64(cfg.IngestStorageConfig.Migration.WritePercentage))
 
 	promauto.With(reg).NewGaugeFunc(prometheus.GaugeOpts{
 		Name:        instanceLimitsMetric,
@@ -2110,6 +2129,19 @@ func (d *Distributor) push(ctx context.Context, pushReq *Request) error {
 		ingestersSubring = d.ingestersRing.ShuffleShard(userID, d.limits.IngestionTenantShardSize(userID))
 	}
 
+	// Handle WritePercentage-based migration: when WritePercentage is between 0 and 100 exclusive,
+	// we need to split series between classic and partition paths based on hash.
+	writePercentage := d.cfg.IngestStorageConfig.Migration.WritePercentage
+	if d.cfg.IngestStorageConfig.Enabled && writePercentage > 0 && writePercentage < 100 {
+		// We need both paths for split routing.
+		if ingestersSubring == nil {
+			ingestersSubring = d.ingestersRing.ShuffleShard(userID, d.limits.IngestionTenantShardSize(userID))
+		}
+
+		cleanupInDefer = false
+		return d.sendWriteRequestWithPercentageSplit(ctx, userID, req, keys, initialMetadataIndex, ingestersSubring, partitionsSubring, pushReq.CleanUp)
+	}
+
 	// we must not re-use buffers now until all writes to backends (e.g. ingesters) have completed, which can happen
 	// even after this function returns. For this reason, it's unsafe to cleanup in the defer and we'll do the cleanup
 	// once all backend requests have completed (see cleanup function passed to sendWriteRequestToBackends()).
@@ -2234,6 +2266,126 @@ func (d *Distributor) sendWriteRequestToBackends(ctx context.Context, tenantID s
 	return ingestersErr
 }
 
+// sendWriteRequestWithPercentageSplit splits the write request based on the WritePercentage setting.
+// Series with hash % 100 < WritePercentage go to partition routing, others go to classic ingester routing.
+// This is NOT dual-write: each series goes to exactly ONE path based on its hash.
+func (d *Distributor) sendWriteRequestWithPercentageSplit(ctx context.Context, tenantID string, req *mimirpb.WriteRequest, keys []uint32, initialMetadataIndex int, ingestersSubring, partitionsSubring ring.DoBatchRing, cleanup func()) error {
+	// Split keys into partition keys and classic keys based on WritePercentage.
+	var partitionKeys, classicKeys []uint32
+	var partitionIndexes, classicIndexes []int
+
+	for i, key := range keys {
+		if d.usePartitionRouting(key) {
+			partitionKeys = append(partitionKeys, key)
+			partitionIndexes = append(partitionIndexes, i)
+		} else {
+			classicKeys = append(classicKeys, key)
+			classicIndexes = append(classicIndexes, i)
+		}
+	}
+
+	// Calculate metadata index offsets for each path.
+	// Original: series from 0 to initialMetadataIndex-1, metadata from initialMetadataIndex to len(keys)-1
+	partitionMetadataIndex := 0
+	classicMetadataIndex := 0
+	for i, idx := range partitionIndexes {
+		if idx >= initialMetadataIndex {
+			partitionMetadataIndex = i
+			break
+		}
+		partitionMetadataIndex = i + 1
+	}
+	for i, idx := range classicIndexes {
+		if idx >= initialMetadataIndex {
+			classicMetadataIndex = i
+			break
+		}
+		classicMetadataIndex = i + 1
+	}
+
+	// Create sub-requests for each path using ForIndexes.
+	var partitionReq, classicReq *mimirpb.WriteRequest
+	if len(partitionIndexes) > 0 {
+		partitionReq = req.ForIndexes(partitionIndexes, initialMetadataIndex)
+	}
+	if len(classicIndexes) > 0 {
+		classicReq = req.ForIndexes(classicIndexes, initialMetadataIndex)
+	}
+
+	// Handle simple cases: only one path has data.
+	if len(partitionKeys) == 0 {
+		return d.sendWriteRequestToBackends(ctx, tenantID, req, keys, initialMetadataIndex, ingestersSubring, nil, cleanup)
+	}
+	if len(classicKeys) == 0 {
+		return d.sendWriteRequestToBackends(ctx, tenantID, req, keys, initialMetadataIndex, nil, partitionsSubring, cleanup)
+	}
+
+	// Both paths have data: send in parallel.
+	var (
+		wg            sync.WaitGroup
+		partitionsErr error
+		ingestersErr  error
+	)
+
+	// Use an independent context for remote requests.
+	remoteRequestContextAndCancel := sync.OnceValues(func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.WithoutCancel(ctx), d.cfg.RemoteTimeout)
+	})
+
+	remoteRequestContext := func() context.Context {
+		ctx, _ := remoteRequestContextAndCancel()
+		return ctx
+	}
+
+	// Track cleanup for both paths.
+	cleanupCount := atomic.NewInt64(2)
+	batchCleanup := func() {
+		if cleanupCount.Dec() == 0 {
+			cleanup()
+			_, cancel := remoteRequestContextAndCancel()
+			cancel()
+		}
+	}
+
+	batchOptions := ring.DoBatchOptions{
+		Cleanup:       batchCleanup,
+		IsClientError: isIngestionClientError,
+		Go:            d.doBatchPushWorkers,
+	}
+
+	wg.Add(2)
+
+	// Send to ingesters (classic path).
+	go func() {
+		defer wg.Done()
+		if classicReq != nil && len(classicKeys) > 0 {
+			d.writePathRequests.WithLabelValues("classic").Inc()
+			ingestersErr = d.sendWriteRequestToIngesters(ctx, ingestersSubring, classicReq, classicKeys, classicMetadataIndex, remoteRequestContext, batchOptions)
+		} else {
+			batchCleanup()
+		}
+	}()
+
+	// Send to partitions.
+	go func() {
+		defer wg.Done()
+		if partitionReq != nil && len(partitionKeys) > 0 {
+			d.writePathRequests.WithLabelValues("partition").Inc()
+			partitionsErr = d.sendWriteRequestToPartitions(ctx, tenantID, partitionsSubring, partitionReq, partitionKeys, partitionMetadataIndex, remoteRequestContext, batchOptions)
+		} else {
+			batchCleanup()
+		}
+	}()
+
+	wg.Wait()
+
+	// Return first error encountered.
+	if partitionsErr != nil {
+		return partitionsErr
+	}
+	return ingestersErr
+}
+
 func (d *Distributor) sendWriteRequestToIngesters(ctx context.Context, tenantRing ring.DoBatchRing, req *mimirpb.WriteRequest, keys []uint32, initialMetadataIndex int, remoteRequestContext func() context.Context, batchOptions ring.DoBatchOptions) error {
 	err := ring.DoBatchWithOptions(ctx, ring.WriteNoExtend, tenantRing, keys,
 		func(ingester ring.InstanceDesc, indexes []int) error {
@@ -2271,6 +2423,13 @@ func (d *Distributor) sendWriteRequestToPartitions(ctx context.Context, tenantID
 			}
 
 			ctx := remoteRequestContext()
+
+			// When Kafka is disabled, write directly to partition owners (ingesters).
+			if !d.cfg.IngestStorageConfig.KafkaConfig.Enabled {
+				return d.writeToPartitionOwners(ctx, int32(partitionID), tenantID, req)
+			}
+
+			// Kafka is enabled: write to Kafka.
 			err = d.ingestStorageWriter.WriteSync(ctx, int32(partitionID), tenantID, req)
 			err = wrapPartitionPushError(err, int32(partitionID))
 			err = wrapDeadlineExceededPushError(err)
@@ -2281,6 +2440,114 @@ func (d *Distributor) sendWriteRequestToPartitions(ctx context.Context, tenantID
 
 	// Since data may be written to different backends it may be helpful to clearly identify which backend failed.
 	return errors.Wrap(err, "send data to partitions")
+}
+
+// writeToPartitionOwners writes the request directly to the partition's owner ingesters
+// instead of going through Kafka. This is used when Kafka is disabled (kafka.enabled: false).
+// It requires zone-aware quorum (2 of 3 zones must ACK for the write to succeed).
+func (d *Distributor) writeToPartitionOwners(ctx context.Context, partitionID int32, tenantID string, req *mimirpb.WriteRequest) error {
+	// Get partition owner IDs from the partition ring.
+	ownerIDs := d.partitionsRing.PartitionRing().PartitionOwnerIDs(partitionID)
+	if len(ownerIDs) == 0 {
+		return fmt.Errorf("partition %d: no owners registered", partitionID)
+	}
+
+	// Resolve owner IDs to InstanceDesc via the ingester ring.
+	now := time.Now()
+	instances := make([]ring.InstanceDesc, 0, len(ownerIDs))
+	healthyZones := make(map[string]bool)
+
+	for _, ownerID := range ownerIDs {
+		instance, err := d.ingestersRing.GetInstance(ownerID)
+		if err != nil {
+			// Owner not in ingester ring, skip (could be removed due to crash).
+			continue
+		}
+
+		if !instance.IsHealthy(ring.Write, d.cfg.PoolConfig.RemoteTimeout, now) {
+			// Owner unhealthy, skip.
+			continue
+		}
+
+		instances = append(instances, instance)
+		healthyZones[instance.Zone] = true
+	}
+
+	// Count unique zones from all registered owners (not just healthy ones) to determine expected zone count.
+	// This is important for quorum calculation.
+	allZones := make(map[string]bool)
+	for _, ownerID := range ownerIDs {
+		instance, err := d.ingestersRing.GetInstance(ownerID)
+		if err != nil {
+			continue
+		}
+		allZones[instance.Zone] = true
+	}
+
+	expectedZones := len(allZones)
+	if expectedZones == 0 {
+		return fmt.Errorf("partition %d: no zones found for partition owners", partitionID)
+	}
+
+	// Calculate minimum required zones for quorum: (expectedZones / 2) + 1
+	// For 3 zones: need 2
+	// For 5 zones: need 3
+	minRequiredZones := (expectedZones / 2) + 1
+	numHealthyZones := len(healthyZones)
+
+	// Validate we have enough healthy zones BEFORE attempting writes.
+	if numHealthyZones < minRequiredZones {
+		return fmt.Errorf("partition %d: insufficient healthy zones for quorum (have %d, need %d of %d)",
+			partitionID, numHealthyZones, minRequiredZones, expectedZones)
+	}
+
+	// Build ReplicationSet with zone-aware quorum.
+	replicationSet := ring.ReplicationSet{
+		Instances:            instances,
+		ZoneAwarenessEnabled: true,
+		// MaxUnavailableZones = numHealthyZones - minRequiredZones
+		// With 3 healthy zones and needing 2: can tolerate 1 failure.
+		// With 2 healthy zones and needing 2: can tolerate 0 failures.
+		MaxUnavailableZones: numHealthyZones - minRequiredZones,
+	}
+
+	// Write to owners with quorum using the Do method.
+	_, err := replicationSet.Do(ctx, 0, func(ctx context.Context, ingester *ring.InstanceDesc) (any, error) {
+		client, err := d.ingesterPool.GetClientForInstance(*ingester)
+		if err != nil {
+			return nil, err
+		}
+
+		c := client.(ingester_client.IngesterClient)
+
+		// Let ingester know the size of the message, without needing to read the message first.
+		ctx = grpcutil.AppendMessageSizeToOutgoingContext(ctx, req)
+
+		_, err = c.Push(ctx, req)
+		err = wrapIngesterPushError(err, ingester.Id)
+		err = wrapDeadlineExceededPushError(err)
+
+		return nil, err
+	})
+
+	if err != nil {
+		return wrapPartitionPushError(err, partitionID)
+	}
+	return nil
+}
+
+// usePartitionRouting returns true if the series with the given hash should use
+// partition routing based on the write percentage migration setting.
+// Series are routed based on: hash % 100 < writePercentage → partition routing.
+func (d *Distributor) usePartitionRouting(hash uint32) bool {
+	pct := d.cfg.IngestStorageConfig.Migration.WritePercentage
+	if pct == 0 {
+		return false
+	}
+	if pct >= 100 {
+		return true
+	}
+	return (hash % 100) < uint32(pct)
 }
 
 // getSeriesAndMetadataTokens returns a slice of tokens for the series and metadata from the request in this specific order.
