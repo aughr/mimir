@@ -1685,3 +1685,116 @@ func readAllMetricNamesByPartitionFromKafka(t testing.TB, kafkaAddresses []strin
 
 	return actualSeriesByPartition
 }
+
+func TestDistributor_Push_WriteToPartitionOwners(t *testing.T) {
+	// This test verifies that when Kafka is disabled, the distributor writes directly
+	// to partition owners (ingesters) using zone-aware quorum semantics.
+	ctx := user.InjectOrgID(context.Background(), "user")
+
+	now := time.Now()
+	mtime.NowForce(now)
+	t.Cleanup(mtime.NowReset)
+
+	createRequest := func() *mimirpb.WriteRequest {
+		return &mimirpb.WriteRequest{
+			Timeseries: []mimirpb.PreallocTimeseries{
+				makeTimeseries([]string{model.MetricNameLabel, "series_one"}, makeSamples(now.UnixMilli(), 1), nil, nil),
+				makeTimeseries([]string{model.MetricNameLabel, "series_two"}, makeSamples(now.UnixMilli(), 2), nil, nil),
+				makeTimeseries([]string{model.MetricNameLabel, "series_three"}, makeSamples(now.UnixMilli(), 3), nil, nil),
+			},
+		}
+	}
+
+	tests := map[string]struct {
+		ingesterStateByZone map[string]ingesterZoneState
+		expectedErr         error
+		expectedPushedZones int // Minimum number of zones that should receive pushes
+	}{
+		"should successfully push to partition owners with 3 zones (2 of 3 quorum)": {
+			ingesterStateByZone: map[string]ingesterZoneState{
+				"zone-a": {numIngesters: 1, happyIngesters: 1},
+				"zone-b": {numIngesters: 1, happyIngesters: 1},
+				"zone-c": {numIngesters: 1, happyIngesters: 1},
+			},
+			expectedPushedZones: 2, // At least 2 of 3 zones should receive push
+		},
+		"should successfully push to partition owners with 2 zones (2 of 2 quorum)": {
+			ingesterStateByZone: map[string]ingesterZoneState{
+				"zone-a": {numIngesters: 1, happyIngesters: 1},
+				"zone-b": {numIngesters: 1, happyIngesters: 1},
+			},
+			expectedPushedZones: 2, // Both zones required
+		},
+		"should successfully push to single zone": {
+			ingesterStateByZone: map[string]ingesterZoneState{
+				"zone-a": {numIngesters: 1, happyIngesters: 1},
+			},
+			expectedPushedZones: 1,
+		},
+		"should fail when one zone is unhealthy in 2-zone setup (no quorum)": {
+			ingesterStateByZone: map[string]ingesterZoneState{
+				"zone-a": {numIngesters: 1, happyIngesters: 1},
+				"zone-b": {numIngesters: 1, happyIngesters: 0}, // Unhappy
+			},
+			expectedErr: fmt.Errorf("at least 2 live replicas required"),
+		},
+		"should succeed when one zone is unhealthy in 3-zone setup (still has quorum)": {
+			ingesterStateByZone: map[string]ingesterZoneState{
+				"zone-a": {numIngesters: 1, happyIngesters: 1},
+				"zone-b": {numIngesters: 1, happyIngesters: 1},
+				"zone-c": {numIngesters: 1, happyIngesters: 0}, // Unhappy - but 2 of 3 is quorum
+			},
+			expectedPushedZones: 2,
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			t.Parallel()
+
+			limits := prepareDefaultLimits()
+
+			testConfig := prepConfig{
+				numDistributors:         1,
+				ingestStorageEnabled:    true,
+				ingestStoragePartitions: 1, // Single partition for simplicity
+				ingesterStateByZone:     testData.ingesterStateByZone,
+				ingesterIngestionType:   ingesterIngestionTypeGRPC, // Direct push, not Kafka
+				limits:                  limits,
+				configure: func(cfg *Config) {
+					// Disable Kafka to use writeToPartitionOwners
+					cfg.IngestStorageConfig.KafkaConfig.Enabled = false
+					cfg.IngestStorageConfig.KafkaConfig.Address = ""
+					cfg.IngestStorageConfig.Migration.WritePercentage = 100
+				},
+			}
+
+			distributors, ingesters, _, _ := prepare(t, testConfig)
+			require.Len(t, distributors, 1)
+
+			// Send write request
+			res, err := distributors[0].Push(ctx, createRequest())
+
+			if testData.expectedErr != nil {
+				require.Error(t, err)
+				require.Nil(t, res)
+				assert.ErrorContains(t, err, testData.expectedErr.Error())
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, emptyResponse, res)
+
+				// Count how many zones received pushes
+				zonesWithPushes := make(map[string]bool)
+				for _, ing := range ingesters {
+					if countCalls(ingesters, "Push") > 0 && ing.timeseries != nil && len(ing.timeseries) > 0 {
+						zonesWithPushes[ing.zone] = true
+					}
+				}
+
+				// Verify at least the expected number of zones received data
+				assert.GreaterOrEqual(t, len(zonesWithPushes), testData.expectedPushedZones,
+					"expected at least %d zones to receive pushes, got %d", testData.expectedPushedZones, len(zonesWithPushes))
+			}
+		})
+	}
+}

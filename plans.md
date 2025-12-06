@@ -60,7 +60,7 @@ This document tracks the implementation progress of the partition ring without K
 
 | Task | Status | File(s) | Notes |
 |------|--------|---------|-------|
-| Write path quorum tests | ⬜ TODO | `pkg/distributor/distributor_test.go` | Critical - future work |
+| Write path quorum tests (`writeToPartitionOwners`) | ✅ DONE | `pkg/distributor/distributor_ingest_storage_test.go` | Added `TestDistributor_Push_WriteToPartitionOwners` |
 | Read path quorum tests (`applyStrictQuorum`) | ✅ DONE | `pkg/distributor/query_test.go` | Added `TestApplyStrictQuorum` |
 | Migration routing tests (`usePartitionRouting`) | ✅ DONE | `pkg/distributor/distributor_test.go` | Added `TestDistributor_usePartitionRouting` |
 | Config validation tests | ✅ DONE | `pkg/storage/ingest/config_test.go` | Added tests for WritePercentage, PartitionIsolationEnabled, KafkaDisabled |
@@ -125,6 +125,9 @@ This document tracks the implementation progress of the partition ring without K
 7. **`pkg/distributor/distributor_test.go`**:
    - Added `TestDistributor_usePartitionRouting` with comprehensive hash/percentage tests
 
+8. **`pkg/distributor/distributor_ingest_storage_test.go`**:
+   - Added `TestDistributor_Push_WriteToPartitionOwners` with zone-aware quorum tests
+
 ### New Files Created
 
 1. **`design.md`**: Full implementation design document
@@ -133,7 +136,6 @@ This document tracks the implementation progress of the partition ring without K
 
 ## Next Steps (Future Work)
 
-1. Add write path quorum tests (complex - requires mocking)
-2. Add integration tests for the migration flow
-3. Add additional metrics (partition health, latency)
-4. Test the full migration path from classic to partition routing
+1. Add integration tests for the migration flow
+2. Add additional metrics (partition health, latency)
+3. Test the full migration path from classic to partition routing
