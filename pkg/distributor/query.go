@@ -119,9 +119,11 @@ func (d *Distributor) getIngesterReplicationSetsForQuery(ctx context.Context) ([
 		return nil, err
 	}
 
-	// When partition isolation is enabled, use per-partition queries.
+	// Use per-partition queries when:
+	// 1. Kafka is enabled (original ingest storage behavior - Kafka guarantees consistency)
+	// 2. Kafka is disabled but partition isolation is enabled (post-cutover for partition ring without Kafka)
 	// This provides per-partition failure isolation.
-	if d.cfg.IngestStorageConfig.Enabled && d.cfg.IngestStorageConfig.PartitionIsolationEnabled {
+	if d.cfg.IngestStorageConfig.Enabled && (d.cfg.IngestStorageConfig.KafkaConfig.Enabled || d.cfg.IngestStorageConfig.PartitionIsolationEnabled) {
 		shardSize := d.limits.IngestionPartitionsTenantShardSize(userID)
 		r := d.partitionsRing
 
@@ -151,9 +153,10 @@ func (d *Distributor) getIngesterReplicationSetsForQuery(ctx context.Context) ([
 		return replicationSets, nil
 	}
 
-	// During migration (partition_isolation_enabled=false) or when ingest storage is disabled,
-	// query ALL ingesters using the classic ring. This ensures we find data regardless
-	// of which path (classic or partition) it was written through.
+	// Use classic ring queries when:
+	// 1. Ingest storage is disabled
+	// 2. Kafka is disabled AND partition_isolation_enabled is false (migration mode for partition ring without Kafka)
+	// This ensures we find data regardless of which path (classic or partition) it was written through.
 	shardSize := d.limits.IngestionTenantShardSize(userID)
 	r := d.ingestersRing
 	r = r.ShuffleShardWithLookback(userID, shardSize, d.cfg.ShuffleShardingLookbackPeriod, time.Now())
