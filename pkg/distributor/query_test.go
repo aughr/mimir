@@ -830,6 +830,16 @@ func TestApplyStrictQuorum(t *testing.T) {
 			expectedMaxUnavailable:  2, // 5 - (5/2 + 1) = 5 - 3 = 2
 			expectedMinRequiredZone: 3,
 		},
+		"RF=0 - degenerate case, handled by early return": {
+			replicationFactor:       0,
+			expectedMaxUnavailable:  0, // early return: RF <= 1
+			expectedMinRequiredZone: 0, // 0 - 0 = 0
+		},
+		"RF=100 - large replication factor": {
+			replicationFactor:       100,
+			expectedMaxUnavailable:  49, // 100 - (100/2 + 1) = 100 - 51 = 49
+			expectedMinRequiredZone: 51,
+		},
 	}
 
 	for testName, testData := range tests {

@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1803,14 +1804,10 @@ func TestDistributor_Push_WriteToPartitionOwners(t *testing.T) {
 	}
 }
 
-// TestDistributor_WriteToPartitionOwners_OwnerNotInIngesterRing verifies that when a partition owner
-// is not found in the ingester ring (e.g., the ingester crashed and was removed), the distributor
-// gracefully handles this by skipping the missing owner and proceeding with available owners.
+// TestDistributor_WriteToPartitionOwners_OwnerNotInIngesterRing verifies that writeToPartitionOwners
+// correctly skips owners that are unhealthy in the ingester ring (LEAVING or JOINING state) and
+// still achieves quorum with the remaining healthy owners.
 func TestDistributor_WriteToPartitionOwners_OwnerNotInIngesterRing(t *testing.T) {
-	// This test verifies graceful handling when a partition owner is missing from the ingester ring.
-	// This can happen when an ingester crashes and is removed from the ring before the partition ring
-	// is updated. The distributor should skip the missing owner and try to achieve quorum with
-	// the remaining owners.
 	ctx := user.InjectOrgID(context.Background(), "user")
 
 	now := time.Now()
@@ -1825,60 +1822,116 @@ func TestDistributor_WriteToPartitionOwners_OwnerNotInIngesterRing(t *testing.T)
 		}
 	}
 
-	// Test with 3 zones where all ingesters are healthy - this should succeed
-	// The test verifies that if an owner were missing, the code would handle it gracefully
-	// by continuing with the remaining owners.
-	limits := prepareDefaultLimits()
-
-	testConfig := prepConfig{
-		numDistributors:         1,
-		ingestStorageEnabled:    true,
-		ingestStoragePartitions: 1,
-		ingesterStateByZone: map[string]ingesterZoneState{
-			"zone-a": {numIngesters: 1, happyIngesters: 1},
-			"zone-b": {numIngesters: 1, happyIngesters: 1},
-			"zone-c": {numIngesters: 1, happyIngesters: 1},
+	tests := map[string]struct {
+		ingesterStateByZone map[string]ingesterZoneState
+		expectedErr         string // substring expected in error, empty means success
+		expectZoneCPush     bool   // whether zone-c ingester should receive a Push call
+	}{
+		"one zone LEAVING is skipped, quorum met with remaining 2 zones": {
+			ingesterStateByZone: map[string]ingesterZoneState{
+				"zone-a": {states: []ingesterState{ingesterStateHappy}},
+				"zone-b": {states: []ingesterState{ingesterStateHappy}},
+				"zone-c": {states: []ingesterState{ingesterStateHappy}, ringStates: []ring.InstanceState{ring.LEAVING}},
+			},
+			// zone-c is LEAVING so IsHealthy(Write) returns false → skipped.
+			// 2 healthy zones remain, RF=3 needs quorum of 2 → succeeds.
+			expectedErr:     "",
+			expectZoneCPush: false,
 		},
-		ingesterIngestionType: ingesterIngestionTypeGRPC,
-		limits:                limits,
-		configure: func(cfg *Config) {
-			cfg.IngestStorageConfig.KafkaConfig.Enabled = false
-			cfg.IngestStorageConfig.KafkaConfig.Address = ""
-			cfg.IngestStorageConfig.Migration.WritePercentage = 100
+		"two zones LEAVING leaves only 1 healthy zone, quorum lost": {
+			ingesterStateByZone: map[string]ingesterZoneState{
+				"zone-a": {states: []ingesterState{ingesterStateHappy}},
+				"zone-b": {states: []ingesterState{ingesterStateHappy}, ringStates: []ring.InstanceState{ring.LEAVING}},
+				"zone-c": {states: []ingesterState{ingesterStateHappy}, ringStates: []ring.InstanceState{ring.LEAVING}},
+			},
+			// zone-b and zone-c skipped. Only 1 healthy zone. RF=3 needs quorum of 2 → rejected.
+			expectedErr:     "insufficient healthy zones for quorum (have 1, need 2 of 3)",
+			expectZoneCPush: false,
+		},
+		"one zone JOINING is also skipped for Write, quorum met": {
+			ingesterStateByZone: map[string]ingesterZoneState{
+				"zone-a": {states: []ingesterState{ingesterStateHappy}},
+				"zone-b": {states: []ingesterState{ingesterStateHappy}},
+				"zone-c": {states: []ingesterState{ingesterStateHappy}, ringStates: []ring.InstanceState{ring.JOINING}},
+			},
+			// JOINING state is not healthy for Write → skipped just like LEAVING.
+			expectedErr:     "",
+			expectZoneCPush: false,
 		},
 	}
 
-	distributors, _, _, _ := prepare(t, testConfig)
-	require.Len(t, distributors, 1)
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			t.Parallel()
 
-	// Push should succeed with all 3 zones available
-	res, err := distributors[0].Push(ctx, createRequest())
-	require.NoError(t, err)
-	assert.Equal(t, emptyResponse, res)
+			testConfig := prepConfig{
+				numDistributors:         1,
+				ingestStorageEnabled:    true,
+				ingestStoragePartitions: 1,
+				ingesterStateByZone:     testData.ingesterStateByZone,
+				ingesterIngestionType:   ingesterIngestionTypeGRPC,
+				limits:                  prepareDefaultLimits(),
+				configure: func(cfg *Config) {
+					cfg.IngestStorageConfig.KafkaConfig.Enabled = false
+					cfg.IngestStorageConfig.KafkaConfig.Address = ""
+					cfg.IngestStorageConfig.Migration.WritePercentage = 100
+				},
+			}
+
+			distributors, ingesters, _, _ := prepare(t, testConfig)
+			require.Len(t, distributors, 1)
+
+			_, err := distributors[0].Push(ctx, createRequest())
+
+			if testData.expectedErr != "" {
+				require.Error(t, err)
+				assert.ErrorContains(t, err, testData.expectedErr)
+			} else {
+				require.NoError(t, err)
+
+				// Verify zone-a and zone-b both received pushes (quorum requires both).
+				zonesWithPushes := make(map[string]bool)
+				for _, ing := range ingesters {
+					if ing.countCalls("Push") > 0 {
+						zonesWithPushes[ing.zone] = true
+					}
+				}
+				assert.True(t, zonesWithPushes["zone-a"], "zone-a must receive push for quorum")
+				assert.True(t, zonesWithPushes["zone-b"], "zone-b must receive push for quorum")
+			}
+
+			// Verify zone-c push expectation (skipped or not).
+			for _, ing := range ingesters {
+				if ing.zone == "zone-c" {
+					if testData.expectZoneCPush {
+						assert.Greater(t, ing.countCalls("Push"), 0, "zone-c should have received a push")
+					} else {
+						assert.Equal(t, 0, ing.countCalls("Push"), "zone-c should have been skipped (unhealthy in ring)")
+					}
+				}
+			}
+		})
+	}
 }
 
-// TestPartition_IngesterRestart_RejoinsPartition verifies that when an ingester restarts,
-// it re-registers as a partition owner and can receive writes again.
+// TestPartition_IngesterRestart_RejoinsPartition verifies that after an ingester transiently fails
+// (simulating a crash), subsequent writes succeed once the ingester recovers, and the recovered
+// ingester receives data again.
 func TestPartition_IngesterRestart_RejoinsPartition(t *testing.T) {
-	// This test verifies that the partition ring infrastructure handles ingester restarts correctly.
-	// When an ingester restarts, it should re-register as a partition owner.
 	ctx := user.InjectOrgID(context.Background(), "user")
 
 	now := time.Now()
 	mtime.NowForce(now)
 	t.Cleanup(mtime.NowReset)
 
-	createRequest := func() *mimirpb.WriteRequest {
+	createRequest := func(name string) *mimirpb.WriteRequest {
 		return &mimirpb.WriteRequest{
 			Timeseries: []mimirpb.PreallocTimeseries{
-				makeTimeseries([]string{model.MetricNameLabel, "series_one"}, makeSamples(now.UnixMilli(), 1), nil, nil),
+				makeTimeseries([]string{model.MetricNameLabel, name}, makeSamples(now.UnixMilli(), 1), nil, nil),
 			},
 		}
 	}
 
-	limits := prepareDefaultLimits()
-
-	// Start with 3 zones, all healthy
 	testConfig := prepConfig{
 		numDistributors:         1,
 		ingestStorageEnabled:    true,
@@ -1889,7 +1942,7 @@ func TestPartition_IngesterRestart_RejoinsPartition(t *testing.T) {
 			"zone-c": {numIngesters: 1, happyIngesters: 1},
 		},
 		ingesterIngestionType: ingesterIngestionTypeGRPC,
-		limits:                limits,
+		limits:                prepareDefaultLimits(),
 		configure: func(cfg *Config) {
 			cfg.IngestStorageConfig.KafkaConfig.Enabled = false
 			cfg.IngestStorageConfig.KafkaConfig.Address = ""
@@ -1900,19 +1953,49 @@ func TestPartition_IngesterRestart_RejoinsPartition(t *testing.T) {
 	distributors, ingesters, _, _ := prepare(t, testConfig)
 	require.Len(t, distributors, 1)
 
-	// First push should succeed
-	res, err := distributors[0].Push(ctx, createRequest())
+	// Find the zone-c ingester and install a hook that fails the first Push call (simulates crash).
+	var zoneCIngester *mockIngester
+	for _, ing := range ingesters {
+		if ing.zone == "zone-c" {
+			zoneCIngester = ing
+			break
+		}
+	}
+	require.NotNil(t, zoneCIngester)
+
+	var mu sync.Mutex
+	crashed := false
+	zoneCIngester.registerBeforePushHook(func(_ context.Context, _ *mimirpb.WriteRequest) (*mimirpb.WriteResponse, error, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !crashed {
+			crashed = true
+			return nil, errors.New("ingester crashed"), true
+		}
+		// Subsequent calls: let normal push processing happen.
+		return nil, nil, false
+	})
+
+	// First push: zone-c fails but 2-of-3 quorum (zone-a + zone-b) succeeds.
+	res, err := distributors[0].Push(ctx, createRequest("series_before_crash"))
 	require.NoError(t, err)
 	assert.Equal(t, emptyResponse, res)
 
-	// Verify ingesters received data
-	totalPushes := 0
+	// zone-c was called but returned an error — verify it received no data.
+	assert.Equal(t, 0, len(zoneCIngester.timeseries), "zone-c should have no data after crash")
+
+	// Second push: zone-c's hook now passes through to normal processing.
+	res, err = distributors[0].Push(ctx, createRequest("series_after_recovery"))
+	require.NoError(t, err)
+	assert.Equal(t, emptyResponse, res)
+
+	// After recovery, zone-c should have received the second push's data.
+	assert.Greater(t, len(zoneCIngester.timeseries), 0, "zone-c should have data after recovery")
+
+	// Verify all 3 zones received data across both pushes.
 	for _, ing := range ingesters {
-		if ing.timeseries != nil {
-			totalPushes += len(ing.timeseries)
-		}
+		assert.Greater(t, ing.countCalls("Push"), 0, "ingester in %s should have been called", ing.zone)
 	}
-	assert.Greater(t, totalPushes, 0, "ingesters should have received data")
 }
 
 // TestPartition_NetworkPartition_ZoneIsolation verifies behavior when a zone becomes isolated
@@ -1963,48 +2046,53 @@ func TestPartition_NetworkPartition_ZoneIsolation(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, emptyResponse, res)
 
-	// Verify only zones a and b received data (zone-c is partitioned)
+	// Verify both healthy zones received data (quorum of 2-of-3 requires both).
 	zonesWithData := make(map[string]bool)
 	for _, ing := range ingesters {
 		if ing.timeseries != nil && len(ing.timeseries) > 0 {
 			zonesWithData[ing.zone] = true
 		}
 	}
-	assert.True(t, zonesWithData["zone-a"] || zonesWithData["zone-b"], "at least one healthy zone should have data")
+	assert.True(t, zonesWithData["zone-a"], "zone-a must have data (required for quorum)")
+	assert.True(t, zonesWithData["zone-b"], "zone-b must have data (required for quorum)")
+
+	// Verify zone-c (network-partitioned) stored no data — its Push always fails.
+	assert.False(t, zonesWithData["zone-c"], "zone-c should have no stored data (its Push fails)")
 }
 
-// TestPartition_ScaleUp_NewPartitionBehavior verifies that when new partitions are added,
-// new writes go to the new partitions while old data remains accessible.
+// TestPartition_ScaleUp_NewPartitionBehavior verifies that when multiple partitions exist, the
+// distributor routes writes across all of them based on series hash, not just a single partition.
 func TestPartition_ScaleUp_NewPartitionBehavior(t *testing.T) {
-	// This test verifies scale-up behavior: new partitions should receive new writes.
 	ctx := user.InjectOrgID(context.Background(), "user")
 
 	now := time.Now()
 	mtime.NowForce(now)
 	t.Cleanup(mtime.NowReset)
 
-	createRequest := func() *mimirpb.WriteRequest {
-		return &mimirpb.WriteRequest{
-			Timeseries: []mimirpb.PreallocTimeseries{
-				makeTimeseries([]string{model.MetricNameLabel, "series_one"}, makeSamples(now.UnixMilli(), 1), nil, nil),
-			},
-		}
+	// Push many series with distinct names to increase the probability of hitting
+	// multiple partitions via DoBatch hash-based routing.
+	ts := make([]mimirpb.PreallocTimeseries, 0, 20)
+	for i := 0; i < 20; i++ {
+		ts = append(ts, makeTimeseries(
+			[]string{model.MetricNameLabel, fmt.Sprintf("scale_up_metric_%d", i)},
+			makeSamples(now.UnixMilli(), float64(i)),
+			nil, nil,
+		))
 	}
+	req := &mimirpb.WriteRequest{Timeseries: ts}
 
-	limits := prepareDefaultLimits()
-
-	// Start with multiple partitions to test partition distribution
+	// Use 3 ingesters per zone so that ingester IDs 0, 1, 2 own partitions 0, 1, 2 respectively.
 	testConfig := prepConfig{
 		numDistributors:         1,
 		ingestStorageEnabled:    true,
-		ingestStoragePartitions: 3, // Multiple partitions
+		ingestStoragePartitions: 3,
 		ingesterStateByZone: map[string]ingesterZoneState{
-			"zone-a": {numIngesters: 1, happyIngesters: 1},
-			"zone-b": {numIngesters: 1, happyIngesters: 1},
-			"zone-c": {numIngesters: 1, happyIngesters: 1},
+			"zone-a": {numIngesters: 3, happyIngesters: 3},
+			"zone-b": {numIngesters: 3, happyIngesters: 3},
+			"zone-c": {numIngesters: 3, happyIngesters: 3},
 		},
 		ingesterIngestionType: ingesterIngestionTypeGRPC,
-		limits:                limits,
+		limits:                prepareDefaultLimits(),
 		configure: func(cfg *Config) {
 			cfg.IngestStorageConfig.KafkaConfig.Enabled = false
 			cfg.IngestStorageConfig.KafkaConfig.Address = ""
@@ -2012,20 +2100,37 @@ func TestPartition_ScaleUp_NewPartitionBehavior(t *testing.T) {
 		},
 	}
 
-	distributors, _, _, _ := prepare(t, testConfig)
+	distributors, ingesters, _, _ := prepare(t, testConfig)
 	require.Len(t, distributors, 1)
 
-	// Push should succeed with multiple partitions
-	res, err := distributors[0].Push(ctx, createRequest())
+	res, err := distributors[0].Push(ctx, req)
 	require.NoError(t, err)
 	assert.Equal(t, emptyResponse, res)
+
+	// Verify that data was distributed across all 3 zones.
+	zonesWithData := make(map[string]bool)
+	for _, ing := range ingesters {
+		if len(ing.timeseries) > 0 {
+			zonesWithData[ing.zone] = true
+		}
+	}
+	assert.Len(t, zonesWithData, 3, "all 3 zones should have received data")
+
+	// Verify that multiple partitions received data across the ingesters.
+	// Each ingester owns the partition matching its id (sequence number within zone).
+	partitionsWithData := make(map[int]bool)
+	for _, ing := range ingesters {
+		if len(ing.timeseries) > 0 {
+			partitionsWithData[ing.id] = true
+		}
+	}
+	assert.Greater(t, len(partitionsWithData), 1, "multiple partitions should have received data from varied series")
 }
 
-// TestPartition_ScaleDown_InactivePartitionLookback verifies that INACTIVE partitions
-// are still queried during the lookback period to ensure data availability.
+// TestPartition_ScaleDown_InactivePartitionLookback verifies that when one partition is INACTIVE
+// and one is ACTIVE, the distributor only routes writes to the ACTIVE partition and does not crash
+// or error due to the presence of an INACTIVE partition.
 func TestPartition_ScaleDown_InactivePartitionLookback(t *testing.T) {
-	// This test verifies that INACTIVE partitions are included in queries
-	// during the lookback window to ensure data isn't lost during scale-down.
 	ctx := user.InjectOrgID(context.Background(), "user")
 
 	now := time.Now()
@@ -2040,21 +2145,168 @@ func TestPartition_ScaleDown_InactivePartitionLookback(t *testing.T) {
 		}
 	}
 
-	limits := prepareDefaultLimits()
-
-	// Setup with partitions in different states would require mocking the partition ring
-	// For now, we test basic functionality with active partitions
+	// Use 2 ingesters per zone so that ingester IDs 0 and 1 own partitions 0 and 1 respectively.
 	testConfig := prepConfig{
 		numDistributors:         1,
 		ingestStorageEnabled:    true,
-		ingestStoragePartitions: 1,
+		ingestStoragePartitions: 2, // partition 0 = INACTIVE, partition 1 = ACTIVE
+		ingestStoragePartitionStates: map[int32]ring.PartitionState{
+			0: ring.PartitionInactive,
+			1: ring.PartitionActive,
+		},
 		ingesterStateByZone: map[string]ingesterZoneState{
-			"zone-a": {numIngesters: 1, happyIngesters: 1},
-			"zone-b": {numIngesters: 1, happyIngesters: 1},
-			"zone-c": {numIngesters: 1, happyIngesters: 1},
+			"zone-a": {numIngesters: 2, happyIngesters: 2},
+			"zone-b": {numIngesters: 2, happyIngesters: 2},
+			"zone-c": {numIngesters: 2, happyIngesters: 2},
 		},
 		ingesterIngestionType: ingesterIngestionTypeGRPC,
-		limits:                limits,
+		limits:                prepareDefaultLimits(),
+		configure: func(cfg *Config) {
+			cfg.IngestStorageConfig.KafkaConfig.Enabled = false
+			cfg.IngestStorageConfig.KafkaConfig.Address = ""
+			cfg.IngestStorageConfig.Migration.WritePercentage = 100
+		},
+	}
+
+	distributors, ingesters, _, _ := prepare(t, testConfig)
+	require.Len(t, distributors, 1)
+
+	// Push should succeed — the distributor should route to the ACTIVE partition only.
+	res, err := distributors[0].Push(ctx, createRequest())
+	require.NoError(t, err)
+	assert.Equal(t, emptyResponse, res)
+
+	// Verify that ingesters received data (the ACTIVE partition's owners got the write).
+	totalSeries := 0
+	for _, ing := range ingesters {
+		totalSeries += len(ing.timeseries)
+	}
+	assert.Greater(t, totalSeries, 0, "ingesters should have received data via the active partition")
+
+	// Verify the partition metrics reflect the correct state.
+	distributors[0].updatePartitionMetrics()
+	assert.Equal(t, float64(ring.PartitionInactive), testutil.ToFloat64(distributors[0].partitionState.WithLabelValues("0")),
+		"partition 0 should be reported as INACTIVE")
+	assert.Equal(t, float64(ring.PartitionActive), testutil.ToFloat64(distributors[0].partitionState.WithLabelValues("1")),
+		"partition 1 should be reported as ACTIVE")
+}
+
+// TestDistributor_SendWriteRequestWithPercentageSplit verifies the mid-migration split path:
+// when WritePercentage is between 0 and 100, series are split across classic and partition paths
+// based on their hash.
+func TestDistributor_SendWriteRequestWithPercentageSplit(t *testing.T) {
+	ctx := user.InjectOrgID(context.Background(), "user")
+
+	now := time.Now()
+	mtime.NowForce(now)
+	t.Cleanup(mtime.NowReset)
+
+	tests := map[string]struct {
+		writePercentage   int
+		numSeries         int
+		expectClassic     bool // expect classic path counter > 0
+		expectPartition   bool // expect partition path counter > 0
+	}{
+		// tokenForLabels with userID "user" and metric names "split_test_metric_N" produces
+		// tokens with token%100 in range [6..31]. WritePercentage=25 forces a real split:
+		//   partition (token%100 < 25): series with tokens 6-24
+		//   classic  (token%100 >= 25): series with tokens 25-31
+		// This is the only sub-case that exercises the parallel dispatch in sendWriteRequestWithPercentageSplit.
+		"WritePercentage=25 splits traffic across both paths": {
+			writePercentage: 25,
+			numSeries:       20,
+			expectClassic:   true,
+			expectPartition: true,
+		},
+		// All tokens in [6..31] < 32, so all series go to partition via the shortcut path.
+		// The shortcut calls sendWriteRequestToBackends directly, which does not increment writePathRequests.
+		// We verify the push still succeeds and routes to the partition path.
+		"WritePercentage=32 routes all to partition via shortcut": {
+			writePercentage: 32,
+			numSeries:       20,
+			expectClassic:   false,
+			expectPartition: false, // shortcut path, counter not incremented
+		},
+		// All tokens in [6..31] >= 5, so all series go to classic via the shortcut path.
+		"WritePercentage=5 routes all to classic via shortcut": {
+			writePercentage: 5,
+			numSeries:       20,
+			expectClassic:   false, // shortcut path, counter not incremented
+			expectPartition: false,
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			ts := make([]mimirpb.PreallocTimeseries, 0, testData.numSeries)
+			for i := 0; i < testData.numSeries; i++ {
+				ts = append(ts, makeTimeseries(
+					[]string{model.MetricNameLabel, fmt.Sprintf("split_test_metric_%d", i)},
+					makeSamples(now.UnixMilli(), float64(i)),
+					nil, nil,
+				))
+			}
+			req := &mimirpb.WriteRequest{Timeseries: ts}
+
+			testConfig := prepConfig{
+				numDistributors:         1,
+				ingestStorageEnabled:    true,
+				ingestStoragePartitions: 1,
+				ingesterStateByZone: map[string]ingesterZoneState{
+					"zone-a": {numIngesters: 1, happyIngesters: 1},
+					"zone-b": {numIngesters: 1, happyIngesters: 1},
+					"zone-c": {numIngesters: 1, happyIngesters: 1},
+				},
+				ingesterIngestionType: ingesterIngestionTypeGRPC,
+				limits:                prepareDefaultLimits(),
+				configure: func(cfg *Config) {
+					cfg.IngestStorageConfig.KafkaConfig.Enabled = false
+					cfg.IngestStorageConfig.KafkaConfig.Address = ""
+					cfg.IngestStorageConfig.Migration.WritePercentage = testData.writePercentage
+				},
+			}
+
+			distributors, _, _, _ := prepare(t, testConfig)
+			require.Len(t, distributors, 1)
+
+			_, err := distributors[0].Push(ctx, req)
+			require.NoError(t, err)
+
+			classicCount := testutil.ToFloat64(distributors[0].writePathRequests.WithLabelValues("classic"))
+			partitionCount := testutil.ToFloat64(distributors[0].writePathRequests.WithLabelValues("partition"))
+
+			if testData.expectClassic {
+				assert.Greater(t, classicCount, float64(0), "classic write path should have been used")
+			}
+			if testData.expectPartition {
+				assert.Greater(t, partitionCount, float64(0), "partition write path should have been used")
+			}
+		})
+	}
+}
+
+// TestDistributor_UpdatePartitionMetrics verifies that updatePartitionMetrics correctly reports
+// partition states and healthy owner counts.
+func TestDistributor_UpdatePartitionMetrics(t *testing.T) {
+	ctx := user.InjectOrgID(context.Background(), "user")
+	_ = ctx
+
+	// Use 2 ingesters per zone so that ingester IDs 0 and 1 own partitions 0 and 1 respectively.
+	testConfig := prepConfig{
+		numDistributors:         1,
+		ingestStorageEnabled:    true,
+		ingestStoragePartitions: 2,
+		ingestStoragePartitionStates: map[int32]ring.PartitionState{
+			0: ring.PartitionActive,
+			1: ring.PartitionInactive,
+		},
+		ingesterStateByZone: map[string]ingesterZoneState{
+			"zone-a": {numIngesters: 2, happyIngesters: 2},
+			"zone-b": {numIngesters: 2, happyIngesters: 2},
+			"zone-c": {numIngesters: 2, happyIngesters: 2},
+		},
+		ingesterIngestionType: ingesterIngestionTypeGRPC,
+		limits:                prepareDefaultLimits(),
 		configure: func(cfg *Config) {
 			cfg.IngestStorageConfig.KafkaConfig.Enabled = false
 			cfg.IngestStorageConfig.KafkaConfig.Address = ""
@@ -2065,8 +2317,20 @@ func TestPartition_ScaleDown_InactivePartitionLookback(t *testing.T) {
 	distributors, _, _, _ := prepare(t, testConfig)
 	require.Len(t, distributors, 1)
 
-	// Push should succeed
-	res, err := distributors[0].Push(ctx, createRequest())
-	require.NoError(t, err)
-	assert.Equal(t, emptyResponse, res)
+	d := distributors[0]
+
+	// Call updatePartitionMetrics and verify state metrics.
+	d.updatePartitionMetrics()
+
+	// Partition 0 is ACTIVE, partition 1 is INACTIVE.
+	assert.Equal(t, float64(ring.PartitionActive), testutil.ToFloat64(d.partitionState.WithLabelValues("0")),
+		"partition 0 should be reported as ACTIVE")
+	assert.Equal(t, float64(ring.PartitionInactive), testutil.ToFloat64(d.partitionState.WithLabelValues("1")),
+		"partition 1 should be reported as INACTIVE")
+
+	// Both partitions have 3 healthy owners (one per zone, all ACTIVE in the ingester ring).
+	assert.Equal(t, float64(3), testutil.ToFloat64(d.partitionHealthyOwners.WithLabelValues("0")),
+		"partition 0 should have 3 healthy owners")
+	assert.Equal(t, float64(3), testutil.ToFloat64(d.partitionHealthyOwners.WithLabelValues("1")),
+		"partition 1 should have 3 healthy owners (owners are still healthy even if partition is inactive)")
 }

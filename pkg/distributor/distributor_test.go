@@ -5599,6 +5599,10 @@ type prepConfig struct {
 	ingestStorageMigrationEnabled bool
 	ingestStoragePartitions       int32 // Number of partitions. Auto-detected from configured ingesters if not explicitly set.
 	ingestStorageKafka            *kfake.Cluster
+
+	// ingestStoragePartitionStates overrides the default Active state for specific partitions.
+	// Key is partition ID, value is the desired PartitionState. Unset partitions default to Active.
+	ingestStoragePartitionStates map[int32]ring.PartitionState
 }
 
 // totalIngesters takes into account ingesterStateByZone and numIngesters.
@@ -5812,7 +5816,11 @@ func preparePartitionsRing(cfg prepConfig, ingesters []*mockIngester) *ring.Part
 
 	// Add all partitions.
 	for partitionID := int32(0); partitionID < cfg.ingestStoragePartitions; partitionID++ {
-		desc.AddPartition(partitionID, ring.PartitionActive, timeBeforeShuffleShardingLookbackPeriod)
+		state := ring.PartitionActive
+		if s, ok := cfg.ingestStoragePartitionStates[partitionID]; ok {
+			state = s
+		}
+		desc.AddPartition(partitionID, state, timeBeforeShuffleShardingLookbackPeriod)
 	}
 
 	// Add all ingesters are partition owners.
@@ -9361,6 +9369,11 @@ func TestDistributor_usePartitionRouting(t *testing.T) {
 			writePercentage: 150,
 			hash:            99,
 			expected:        true,
+		},
+		"percentage 50 with max uint32 hash routes classic (MaxUint32 % 100 = 95 >= 50)": {
+			writePercentage: 50,
+			hash:            math.MaxUint32,
+			expected:        false, // 4294967295 % 100 = 95 >= 50
 		},
 	}
 
