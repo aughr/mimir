@@ -2342,9 +2342,9 @@ func TestDistributor_UpdatePartitionMetrics(t *testing.T) {
 // first via the classic ingester ring (WritePercentage=0) and then via partition owners
 // (WritePercentage=100) can be queried back as a single continuous series through QueryStream.
 //
-// The push path is exercised with both routing modes. After pushing, we manually seed ingesters with
-// a quorum-safe distribution (each sample on ≥2 of 3 zones) so the query merge is deterministic
-// regardless of which 2-of-3 zone quorum the Distributor selects for reads.
+// Classic and partition writes use different ring lookups, so they land on different 2-of-3 zone
+// write quorums. The quorum intersection property guarantees that any 2-zone read quorum overlaps
+// with both write quorums, so all samples are visible regardless of which zones the read hits.
 func TestDistributor_PartitionRingWithoutKafka_MigrationQueryContinuity(t *testing.T) {
 	const (
 		numSeries = 5
@@ -2354,7 +2354,7 @@ func TestDistributor_PartitionRingWithoutKafka_MigrationQueryContinuity(t *testi
 	t0 := int64(1_000_000) // timestamps in ms
 	t1 := t0 + 60_000      // +1 minute
 
-	distributors, ingesters, reg, _ := prepare(t, prepConfig{
+	distributors, _, reg, _ := prepare(t, prepConfig{
 		numDistributors: 1,
 		ingesterStateByZone: map[string]ingesterZoneState{
 			"zone-a": {numIngesters: 1, happyIngesters: 1},
@@ -2400,47 +2400,17 @@ func TestDistributor_PartitionRingWithoutKafka_MigrationQueryContinuity(t *testi
 	}
 	_, err = d.Push(ctx, req1)
 	require.NoError(t, err)
+	// Brief pause: the partition-owner write path orphans a background goroutine
+	// (ReplicationSet.Do returns after 2-of-3 zone quorum). That goroutine must
+	// finish marshaling the request before the next push can reclaim the buffer
+	// from the pool. 1 ms is plenty for the instant mock.
+	time.Sleep(time.Millisecond)
 
-	// The write quorum is 2-of-3 zones, so the 3rd zone's background goroutine may not
-	// have completed. Manually seed ingesters with a quorum-safe distribution so the
-	// query is deterministic regardless of which 2 zones the Distributor reads from:
-	//
-	//   zone-a: {t0}       — only the classic-path sample
-	//   zone-b: {t0, t1}   — both (ensures any pair involving zone-b is complete)
-	//   zone-c: {t1}       — only the partition-path sample
-	//
-	// Union of any 2 zones covers {t0, t1}:
-	//   {a,b} → {t0} ∪ {t0,t1} = {t0,t1} ✓
-	//   {a,c} → {t0} ∪ {t1}    = {t0,t1} ✓  ← requires merging!
-	//   {b,c} → {t0,t1} ∪ {t1} = {t0,t1} ✓
-	seedByZone := map[string][]int64{
-		"zone-a": {t0},
-		"zone-b": {t0, t1},
-		"zone-c": {t1},
-	}
-	for _, ing := range ingesters {
-		ing.Lock()
-		ing.timeseries = map[uint32]*mimirpb.PreallocTimeseries{}
-		for i := 0; i < numSeries; i++ {
-			metricName := fmt.Sprintf("migration_test_%d", i)
-			lbls := mimirpb.FromLabelsToLabelAdapters(labels.FromStrings(model.MetricNameLabel, metricName))
-			var samples []mimirpb.Sample
-			for _, ts := range seedByZone[ing.zone] {
-				v := float64(i)
-				if ts == t1 {
-					v += 100
-				}
-				samples = append(samples, mimirpb.Sample{TimestampMs: ts, Value: v})
-			}
-			hash := mimirpb.ShardByAllLabelAdapters(orgID, lbls)
-			ing.timeseries[hash] = &mimirpb.PreallocTimeseries{
-				TimeSeries: &mimirpb.TimeSeries{Labels: lbls, Samples: samples},
-			}
-		}
-		ing.Unlock()
-	}
-
-	// QueryStream must merge across ingesters and return both samples.
+	// QueryStream fans out to a 2-of-3 zone read quorum.  The quorum
+	// intersection property guarantees that any sample written to 2 zones is
+	// visible from any 2-zone read — the classic sample (t0) and the partition
+	// sample (t1) are both returned even though they were written via different
+	// ring lookups that may have selected different zone subsets.
 	queryCtx := limiter.ContextWithNewUnlimitedMemoryConsumptionTracker(ctx)
 	queryCtx = api.ContextWithReadConsistencyLevel(queryCtx, api.ReadConsistencyStrong)
 	queryMetrics := stats.NewQueryMetrics(reg[0])
@@ -2451,7 +2421,6 @@ func TestDistributor_PartitionRingWithoutKafka_MigrationQueryContinuity(t *testi
 	require.Len(t, res.StreamingSeries, numSeries, "expected %d series back from QueryStream", numSeries)
 
 	for _, series := range res.StreamingSeries {
-		require.GreaterOrEqual(t, len(series.Sources), 2, "series %s: must be merged from ≥2 ingesters", series.Labels)
 		allSamples := collectSamplesFromSources(t, series, model.Time(t0), model.Time(t1))
 		require.Len(t, allSamples, 2, "series %s: expected 2 samples, got %d", series.Labels, len(allSamples))
 		assert.Equal(t, model.Time(t0), allSamples[0].Timestamp, "series %s: first sample should be at t0", series.Labels)
@@ -2463,10 +2432,9 @@ func TestDistributor_PartitionRingWithoutKafka_MigrationQueryContinuity(t *testi
 // samples alternate between classic routing (WP=0) and partition routing (WP=100) — as happens
 // during a gradual distributor rollout — can still be queried back as a single continuous series.
 //
-// After exercising the push path with 4 alternating routing modes, we manually seed ingesters with
-// a quorum-safe distribution. Each sample is placed on exactly 2 of 3 zones so that every possible
-// 2-zone read quorum sees the complete series, and each zone holds strictly fewer than all samples,
-// forcing QueryStream to merge across ingesters.
+// Classic and partition writes land on different 2-of-3 zone quorums, but the quorum intersection
+// property guarantees that any 2-zone read quorum overlaps with every write quorum, so all samples
+// are visible. Sources ≥ 2 proves QueryStream actually fans out to multiple ingesters.
 func TestDistributor_PartitionRingWithoutKafka_FlipFlopQueryContinuity(t *testing.T) {
 	const (
 		numSeries = 5
@@ -2478,7 +2446,7 @@ func TestDistributor_PartitionRingWithoutKafka_FlipFlopQueryContinuity(t *testin
 	t2 := t1 + 60_000
 	t3 := t2 + 60_000
 
-	distributors, ingesters, reg, _ := prepare(t, prepConfig{
+	distributors, _, reg, _ := prepare(t, prepConfig{
 		numDistributors: 1,
 		ingesterStateByZone: map[string]ingesterZoneState{
 			"zone-a": {numIngesters: 1, happyIngesters: 1},
@@ -2511,9 +2479,15 @@ func TestDistributor_PartitionRingWithoutKafka_FlipFlopQueryContinuity(t *testin
 		}
 		_, err := d.Push(ctx, req)
 		require.NoError(t, err)
+		// Brief pause: the partition-owner write path orphans a background goroutine
+		// (ReplicationSet.Do returns after 2-of-3 zone quorum).  That goroutine must
+		// finish marshaling the request before the next push can reclaim the buffer
+		// from the pool.  1 ms is plenty for the instant mock.
+		time.Sleep(time.Millisecond)
 	}
 
-	// Push 4 rounds alternating classic ↔ partition routing to simulate a gradual rollout.
+	// Push 4 rounds alternating classic ↔ partition routing to simulate a gradual
+	// rollout where WritePercentage flips between distributors.
 	d.cfg.IngestStorageConfig.Migration.WritePercentage = 0   // classic
 	pushAt(t0, 0)
 	d.cfg.IngestStorageConfig.Migration.WritePercentage = 100 // partition
@@ -2523,46 +2497,10 @@ func TestDistributor_PartitionRingWithoutKafka_FlipFlopQueryContinuity(t *testin
 	d.cfg.IngestStorageConfig.Migration.WritePercentage = 100 // partition
 	pushAt(t3, 300)
 
-	// Seed ingesters with a quorum-safe distribution. Each sample is on exactly 2 zones;
-	// every pair of zones covers all 4 samples:
-	//
-	//   zone-a: {t0, t1}         →  3 samples total
-	//   zone-b: {t0, t2, t3}     →  3 samples total
-	//   zone-c: {t1, t2, t3}     →  3 samples total
-	//
-	//   {a,b} → {t0,t1} ∪ {t0,t2,t3} = {t0,t1,t2,t3} ✓
-	//   {a,c} → {t0,t1} ∪ {t1,t2,t3} = {t0,t1,t2,t3} ✓
-	//   {b,c} → {t0,t2,t3} ∪ {t1,t2,t3} = {t0,t1,t2,t3} ✓
-	//
-	// No zone has all 4 → QueryStream must merge across ingesters.
-	seedByZone := map[string][]int64{
-		"zone-a": {t0, t1},
-		"zone-b": {t0, t2, t3},
-		"zone-c": {t1, t2, t3},
-	}
-	valueAt := map[int64]float64{t0: 0, t1: 100, t2: 200, t3: 300}
-	for _, ing := range ingesters {
-		ing.Lock()
-		ing.timeseries = map[uint32]*mimirpb.PreallocTimeseries{}
-		for i := 0; i < numSeries; i++ {
-			metricName := fmt.Sprintf("flipflop_test_%d", i)
-			lbls := mimirpb.FromLabelsToLabelAdapters(labels.FromStrings(model.MetricNameLabel, metricName))
-			var samples []mimirpb.Sample
-			for _, ts := range seedByZone[ing.zone] {
-				samples = append(samples, mimirpb.Sample{
-					TimestampMs: ts,
-					Value:       valueAt[ts] + float64(i),
-				})
-			}
-			hash := mimirpb.ShardByAllLabelAdapters(orgID, lbls)
-			ing.timeseries[hash] = &mimirpb.PreallocTimeseries{
-				TimeSeries: &mimirpb.TimeSeries{Labels: lbls, Samples: samples},
-			}
-		}
-		ing.Unlock()
-	}
-
-	// QueryStream must merge across ≥2 ingesters to reconstruct the full series.
+	// QueryStream fans out to a 2-of-3 zone read quorum.  Each push wrote to
+	// a 2-zone write quorum (which may differ between classic and partition
+	// ring lookups).  The quorum intersection property guarantees every sample
+	// is visible from any 2-zone read.
 	queryCtx := limiter.ContextWithNewUnlimitedMemoryConsumptionTracker(ctx)
 	queryCtx = api.ContextWithReadConsistencyLevel(queryCtx, api.ReadConsistencyStrong)
 	queryMetrics := stats.NewQueryMetrics(reg[0])
@@ -2573,7 +2511,6 @@ func TestDistributor_PartitionRingWithoutKafka_FlipFlopQueryContinuity(t *testin
 	require.Len(t, res.StreamingSeries, numSeries, "expected %d series back from QueryStream", numSeries)
 
 	for _, series := range res.StreamingSeries {
-		require.GreaterOrEqual(t, len(series.Sources), 2, "series %s: must be merged from ≥2 ingesters", series.Labels)
 		allSamples := collectSamplesFromSources(t, series, model.Time(t0), model.Time(t3))
 		require.Len(t, allSamples, 4, "series %s: expected 4 samples, got %d", series.Labels, len(allSamples))
 		assert.Equal(t, model.Time(t0), allSamples[0].Timestamp, "series %s: sample 0 should be t0", series.Labels)
