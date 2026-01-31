@@ -12,6 +12,7 @@ import (
 	e2edb "github.com/grafana/e2e/db"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/prompb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -363,4 +364,267 @@ func TestPartitionRingWithoutKafkaRollback(t *testing.T) {
 	// Note: In a real rollback scenario, you would restart the distributor with
 	// write_percentage=0. Since we're testing the data path, verifying that
 	// queries still work after writes confirms the rollback-safe data model.
+}
+
+// TestPartitionRingWithoutKafkaMigrationQueryContinuity verifies that a PromQL range query
+// returns a continuous series when samples are written through both the classic and partition
+// write paths during migration. This is the key correctness invariant: partition owners are
+// the same ingesters as the classic ring members, so samples written via either path coexist
+// on the same ingester and must appear as one continuous time series when queried.
+//
+// The test performs the migration in two phases by stopping and restarting the distributor
+// with a different write-percentage, mirroring what happens during a real cutover.
+func TestPartitionRingWithoutKafkaMigrationQueryContinuity(t *testing.T) {
+	s, err := e2e.NewScenario(networkName)
+	require.NoError(t, err)
+	defer s.Close()
+
+	// Base flags shared by ingesters and querier.
+	// partition_isolation_enabled=false throughout: queries fan out via the classic ring so
+	// they see data regardless of which write path deposited it.
+	baseFlags := mergeFlags(
+		BlocksStorageFlags(),
+		BlocksStorageS3Flags(),
+		map[string]string{
+			"-ingest-storage.enabled":                     "true",
+			"-ingest-storage.kafka.enabled":               "false",
+			"-ingest-storage.partition-isolation-enabled":  "false",
+			"-ingester.partition-ring.min-partition-owners-count":    "0",
+			"-ingester.partition-ring.min-partition-owners-duration": "0s",
+			"-ingester.ring.zone-awareness-enabled":       "true",
+			"-ingester.ring.replication-factor":           "3",
+		},
+	)
+
+	// Start dependencies.
+	consul := e2edb.NewConsul()
+	minio := e2edb.NewMinio(9000, baseFlags["-blocks-storage.s3.bucket-name"])
+	require.NoError(t, s.StartAndWaitReady(consul, minio))
+
+	// Start ingesters — one per zone.
+	ingesterFlags := func(zone string) map[string]string {
+		return mergeFlags(baseFlags, map[string]string{
+			"-ingester.ring.instance-availability-zone": zone,
+		})
+	}
+	ingester1 := e2emimir.NewIngester("ingester-1", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-a"))
+	ingester2 := e2emimir.NewIngester("ingester-2", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-b"))
+	ingester3 := e2emimir.NewIngester("ingester-3", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-c"))
+	require.NoError(t, s.StartAndWaitReady(ingester1, ingester2, ingester3))
+
+	// --- Phase 1: distributor with WritePercentage=0 (classic ingester ring) ---
+	classicFlags := mergeFlags(baseFlags, map[string]string{
+		"-ingest-storage.migration.write-percentage": "0",
+	})
+	distributor := e2emimir.NewDistributor("distributor", consul.NetworkHTTPEndpoint(), classicFlags)
+	querier := e2emimir.NewQuerier("querier", consul.NetworkHTTPEndpoint(), baseFlags)
+	require.NoError(t, s.StartAndWaitReady(distributor, querier))
+
+	require.NoError(t, distributor.WaitSumMetricsWithOptions(e2e.Equals(3), []string{"cortex_ring_members"}, e2e.WithLabelMatchers(
+		labels.MustNewMatcher(labels.MatchEqual, "name", "ingester"),
+		labels.MustNewMatcher(labels.MatchEqual, "state", "ACTIVE"))))
+	require.NoError(t, querier.WaitSumMetricsWithOptions(e2e.Equals(3), []string{"cortex_ring_members"}, e2e.WithLabelMatchers(
+		labels.MustNewMatcher(labels.MatchEqual, "name", "ingester"),
+		labels.MustNewMatcher(labels.MatchEqual, "state", "ACTIVE"))))
+
+	client, err := e2emimir.NewClient(distributor.HTTPEndpoint(), querier.HTTPEndpoint(), "", "", userID)
+	require.NoError(t, err)
+
+	// Two sample timestamps, 1 minute apart.  Using recent-past timestamps so they
+	// fall within the default staleness lookback window (5 min).
+	now := time.Now()
+	t0 := now.Add(-2 * time.Minute)
+	t1 := now.Add(-1 * time.Minute)
+
+	numSeries := 10
+
+	// Push phase-1 samples at t0 via classic path.
+	for i := 0; i < numSeries; i++ {
+		metricName := fmt.Sprintf("continuity_series_%d", i)
+		res, err := client.Push([]prompb.TimeSeries{{
+			Labels:  []prompb.Label{{Name: "__name__", Value: metricName}},
+			Samples: []prompb.Sample{{Value: float64(i) + 1.0, Timestamp: e2e.TimeToMilliseconds(t0)}},
+		}})
+		require.NoError(t, err)
+		require.Equal(t, 200, res.StatusCode, "phase-1 push of %s failed", metricName)
+	}
+
+	// Verify the classic-path counter is zero (WritePercentage=0 never enters the split function).
+	require.NoError(t, distributor.WaitSumMetricsWithOptions(e2e.Equals(0), []string{"cortex_distributor_write_requests_total"},
+		e2e.SkipMissingMetrics,
+		e2e.WithLabelMatchers(labels.MustNewMatcher(labels.MatchEqual, "path", "partition"))))
+
+	// --- Phase 2: stop distributor, restart with WritePercentage=100 (partition owners) ---
+	require.NoError(t, s.Stop(distributor))
+
+	partitionFlags := mergeFlags(baseFlags, map[string]string{
+		"-ingest-storage.migration.write-percentage": "100",
+	})
+	distributor = e2emimir.NewDistributor("distributor", consul.NetworkHTTPEndpoint(), partitionFlags)
+	require.NoError(t, s.StartAndWaitReady(distributor))
+
+	require.NoError(t, distributor.WaitSumMetricsWithOptions(e2e.Equals(3), []string{"cortex_ring_members"}, e2e.WithLabelMatchers(
+		labels.MustNewMatcher(labels.MatchEqual, "name", "ingester"),
+		labels.MustNewMatcher(labels.MatchEqual, "state", "ACTIVE"))))
+
+	// Rebuild client to pick up the (potentially different) distributor endpoint.
+	client, err = e2emimir.NewClient(distributor.HTTPEndpoint(), querier.HTTPEndpoint(), "", "", userID)
+	require.NoError(t, err)
+
+	// Push phase-2 samples at t1 via partition path.  Values are offset by 100 so
+	// we can distinguish phase-1 and phase-2 samples in the assertion below.
+	for i := 0; i < numSeries; i++ {
+		metricName := fmt.Sprintf("continuity_series_%d", i)
+		res, err := client.Push([]prompb.TimeSeries{{
+			Labels:  []prompb.Label{{Name: "__name__", Value: metricName}},
+			Samples: []prompb.Sample{{Value: float64(i) + 101.0, Timestamp: e2e.TimeToMilliseconds(t1)}},
+		}})
+		require.NoError(t, err)
+		require.Equal(t, 200, res.StatusCode, "phase-2 push of %s failed", metricName)
+	}
+
+	// --- Assertion: range query returns both samples as one continuous series ---
+	// Step = 1 min, range = [t0, t1] → two evaluation points at exactly t0 and t1.
+	for i := 0; i < numSeries; i++ {
+		metricName := fmt.Sprintf("continuity_series_%d", i)
+		result, err := client.QueryRange(metricName, t0, t1, time.Minute)
+		require.NoError(t, err)
+		require.Equal(t, model.ValMatrix, result.Type(), "metric %s", metricName)
+
+		matrix := result.(model.Matrix)
+		require.Len(t, matrix, 1, "metric %s: expected exactly 1 series stream", metricName)
+		require.Len(t, matrix[0].Values, 2,
+			"metric %s: expected 2 samples (one classic, one partition) stitched into a single series, got %d",
+			metricName, len(matrix[0].Values))
+
+		assert.Equal(t, model.SampleValue(float64(i)+1.0), matrix[0].Values[0].V,
+			"metric %s: sample at t0 (classic path) value mismatch", metricName)
+		assert.Equal(t, model.SampleValue(float64(i)+101.0), matrix[0].Values[1].V,
+			"metric %s: sample at t1 (partition path) value mismatch", metricName)
+	}
+}
+
+// TestPartitionRingWithoutKafkaFlipFlopRouting verifies that samples belonging to the same
+// series are correctly stitched by a range query even when they arrive through alternating
+// write paths.  This models a gradual distributor rollout where some pods have
+// write-percentage=0 (classic) and others have write-percentage=100 (partition), and the
+// client hits different pods for successive pushes of the same metric.
+//
+// Two distributors run simultaneously against the same set of ingesters.  Pushes for each
+// series alternate: classic → partition → classic → partition.  A single range query must
+// return all four samples as one continuous series.
+func TestPartitionRingWithoutKafkaFlipFlopRouting(t *testing.T) {
+	s, err := e2e.NewScenario(networkName)
+	require.NoError(t, err)
+	defer s.Close()
+
+	baseFlags := mergeFlags(
+		BlocksStorageFlags(),
+		BlocksStorageS3Flags(),
+		map[string]string{
+			"-ingest-storage.enabled":                     "true",
+			"-ingest-storage.kafka.enabled":               "false",
+			"-ingest-storage.partition-isolation-enabled":  "false",
+			"-ingester.partition-ring.min-partition-owners-count":    "0",
+			"-ingester.partition-ring.min-partition-owners-duration": "0s",
+			"-ingester.ring.zone-awareness-enabled":       "true",
+			"-ingester.ring.replication-factor":           "3",
+		},
+	)
+
+	// Start dependencies.
+	consul := e2edb.NewConsul()
+	minio := e2edb.NewMinio(9000, baseFlags["-blocks-storage.s3.bucket-name"])
+	require.NoError(t, s.StartAndWaitReady(consul, minio))
+
+	// Start ingesters — one per zone.
+	ingesterFlags := func(zone string) map[string]string {
+		return mergeFlags(baseFlags, map[string]string{
+			"-ingester.ring.instance-availability-zone": zone,
+		})
+	}
+	ingester1 := e2emimir.NewIngester("ingester-1", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-a"))
+	ingester2 := e2emimir.NewIngester("ingester-2", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-b"))
+	ingester3 := e2emimir.NewIngester("ingester-3", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-c"))
+	require.NoError(t, s.StartAndWaitReady(ingester1, ingester2, ingester3))
+
+	// Two distributors simulating pods at different stages of a rolling rollout.
+	classicFlags := mergeFlags(baseFlags, map[string]string{
+		"-ingest-storage.migration.write-percentage": "0",
+	})
+	partitionFlags := mergeFlags(baseFlags, map[string]string{
+		"-ingest-storage.migration.write-percentage": "100",
+	})
+	distributorClassic := e2emimir.NewDistributor("distributor-classic", consul.NetworkHTTPEndpoint(), classicFlags)
+	distributorPartition := e2emimir.NewDistributor("distributor-partition", consul.NetworkHTTPEndpoint(), partitionFlags)
+	querier := e2emimir.NewQuerier("querier", consul.NetworkHTTPEndpoint(), baseFlags)
+	require.NoError(t, s.StartAndWaitReady(distributorClassic, distributorPartition, querier))
+
+	// Wait for ring convergence on all three components.
+	for _, svc := range []*e2emimir.MimirService{distributorClassic, distributorPartition, querier} {
+		require.NoError(t, svc.WaitSumMetricsWithOptions(e2e.Equals(3), []string{"cortex_ring_members"}, e2e.WithLabelMatchers(
+			labels.MustNewMatcher(labels.MatchEqual, "name", "ingester"),
+			labels.MustNewMatcher(labels.MatchEqual, "state", "ACTIVE"))))
+	}
+
+	// Two clients, one per distributor.  Both query through the same querier.
+	clientClassic, err := e2emimir.NewClient(distributorClassic.HTTPEndpoint(), querier.HTTPEndpoint(), "", "", userID)
+	require.NoError(t, err)
+	clientPartition, err := e2emimir.NewClient(distributorPartition.HTTPEndpoint(), querier.HTTPEndpoint(), "", "", userID)
+	require.NoError(t, err)
+
+	// Four sample timestamps, 1 minute apart, all within the staleness lookback window.
+	now := time.Now()
+	timestamps := [4]time.Time{
+		now.Add(-4 * time.Minute),
+		now.Add(-3 * time.Minute),
+		now.Add(-2 * time.Minute),
+		now.Add(-1 * time.Minute),
+	}
+
+	// Push order alternates: classic, partition, classic, partition.
+	clients := [4]*e2emimir.Client{clientClassic, clientPartition, clientClassic, clientPartition}
+	pathNames := [4]string{"classic", "partition", "classic", "partition"}
+
+	numSeries := 10
+	type sampleExpectation struct {
+		values [4]float64
+	}
+	expectations := make(map[string]sampleExpectation, numSeries)
+
+	for i := 0; i < numSeries; i++ {
+		metricName := fmt.Sprintf("flipflop_series_%d", i)
+		var exp sampleExpectation
+		for j := 0; j < 4; j++ {
+			exp.values[j] = float64(i*10 + j + 1) // distinct per series and per sample
+			res, err := clients[j].Push([]prompb.TimeSeries{{
+				Labels:  []prompb.Label{{Name: "__name__", Value: metricName}},
+				Samples: []prompb.Sample{{Value: exp.values[j], Timestamp: e2e.TimeToMilliseconds(timestamps[j])}},
+			}})
+			require.NoError(t, err)
+			require.Equal(t, 200, res.StatusCode,
+				"push of %s sample %d via %s failed", metricName, j, pathNames[j])
+		}
+		expectations[metricName] = exp
+	}
+
+	// --- Assertion: range query stitches all four samples into one series ---
+	// Step = 1 min, range = [timestamps[0], timestamps[3]] → four evaluation points.
+	for metricName, exp := range expectations {
+		result, err := clientClassic.QueryRange(metricName, timestamps[0], timestamps[3], time.Minute)
+		require.NoError(t, err)
+		require.Equal(t, model.ValMatrix, result.Type(), "metric %s", metricName)
+
+		matrix := result.(model.Matrix)
+		require.Len(t, matrix, 1,
+			"metric %s: expected exactly 1 series stream", metricName)
+		require.Len(t, matrix[0].Values, 4,
+			"metric %s: expected 4 samples stitched across alternating classic/partition write paths, got %d",
+			metricName, len(matrix[0].Values))
+
+		for j := 0; j < 4; j++ {
+			assert.Equal(t, model.SampleValue(exp.values[j]), matrix[0].Values[j].V,
+				"metric %s sample %d (written via %s): value mismatch", metricName, j, pathNames[j])
+		}
+	}
 }
