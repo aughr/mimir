@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,10 +38,12 @@ import (
 
 	"github.com/grafana/mimir/pkg/cardinality"
 	"github.com/grafana/mimir/pkg/ingester/client"
+	"github.com/grafana/mimir/pkg/querier/api"
 	"github.com/grafana/mimir/pkg/mimirpb"
 	"github.com/grafana/mimir/pkg/querier/stats"
 	"github.com/grafana/mimir/pkg/storage/ingest"
 	"github.com/grafana/mimir/pkg/util/extract"
+	"github.com/grafana/mimir/pkg/util/limiter"
 	"github.com/grafana/mimir/pkg/util/testkafka"
 	"github.com/grafana/mimir/pkg/util/validation"
 )
@@ -2333,4 +2336,280 @@ func TestDistributor_UpdatePartitionMetrics(t *testing.T) {
 		"partition 0 should have 3 healthy owners")
 	assert.Equal(t, float64(3), testutil.ToFloat64(d.partitionHealthyOwners.WithLabelValues("1")),
 		"partition 1 should have 3 healthy owners (owners are still healthy even if partition is inactive)")
+}
+
+// TestDistributor_PartitionRingWithoutKafka_MigrationQueryContinuity verifies that a series written
+// first via the classic ingester ring (WritePercentage=0) and then via partition owners
+// (WritePercentage=100) can be queried back as a single continuous series through QueryStream.
+//
+// The push path is exercised with both routing modes. After pushing, we manually seed ingesters with
+// a quorum-safe distribution (each sample on ≥2 of 3 zones) so the query merge is deterministic
+// regardless of which 2-of-3 zone quorum the Distributor selects for reads.
+func TestDistributor_PartitionRingWithoutKafka_MigrationQueryContinuity(t *testing.T) {
+	const (
+		numSeries = 5
+		orgID     = "test"
+	)
+
+	t0 := int64(1_000_000) // timestamps in ms
+	t1 := t0 + 60_000      // +1 minute
+
+	distributors, ingesters, reg, _ := prepare(t, prepConfig{
+		numDistributors: 1,
+		ingesterStateByZone: map[string]ingesterZoneState{
+			"zone-a": {numIngesters: 1, happyIngesters: 1},
+			"zone-b": {numIngesters: 1, happyIngesters: 1},
+			"zone-c": {numIngesters: 1, happyIngesters: 1},
+		},
+		ingesterIngestionType:   ingesterIngestionTypeGRPC,
+		ingestStorageEnabled:    true,
+		ingestStoragePartitions: 1,
+		limits:                  prepareDefaultLimits(),
+		configure: func(cfg *Config) {
+			cfg.IngestStorageConfig.KafkaConfig.Enabled = false
+			cfg.IngestStorageConfig.KafkaConfig.Address = ""
+			cfg.IngestStorageConfig.Migration.WritePercentage = 0
+		},
+	})
+	require.Len(t, distributors, 1)
+	d := distributors[0]
+
+	ctx := user.InjectOrgID(context.Background(), orgID)
+
+	// Push at t0 via classic path (WP=0).
+	req0 := &mimirpb.WriteRequest{}
+	for i := 0; i < numSeries; i++ {
+		req0.Timeseries = append(req0.Timeseries, makeTimeseries(
+			[]string{model.MetricNameLabel, fmt.Sprintf("migration_test_%d", i)},
+			makeSamples(t0, float64(i)),
+			nil, nil,
+		))
+	}
+	_, err := d.Push(ctx, req0)
+	require.NoError(t, err)
+
+	// Switch to partition routing (WP=100) and push at t1.
+	d.cfg.IngestStorageConfig.Migration.WritePercentage = 100
+	req1 := &mimirpb.WriteRequest{}
+	for i := 0; i < numSeries; i++ {
+		req1.Timeseries = append(req1.Timeseries, makeTimeseries(
+			[]string{model.MetricNameLabel, fmt.Sprintf("migration_test_%d", i)},
+			makeSamples(t1, float64(i)+100),
+			nil, nil,
+		))
+	}
+	_, err = d.Push(ctx, req1)
+	require.NoError(t, err)
+
+	// The write quorum is 2-of-3 zones, so the 3rd zone's background goroutine may not
+	// have completed. Manually seed ingesters with a quorum-safe distribution so the
+	// query is deterministic regardless of which 2 zones the Distributor reads from:
+	//
+	//   zone-a: {t0}       — only the classic-path sample
+	//   zone-b: {t0, t1}   — both (ensures any pair involving zone-b is complete)
+	//   zone-c: {t1}       — only the partition-path sample
+	//
+	// Union of any 2 zones covers {t0, t1}:
+	//   {a,b} → {t0} ∪ {t0,t1} = {t0,t1} ✓
+	//   {a,c} → {t0} ∪ {t1}    = {t0,t1} ✓  ← requires merging!
+	//   {b,c} → {t0,t1} ∪ {t1} = {t0,t1} ✓
+	seedByZone := map[string][]int64{
+		"zone-a": {t0},
+		"zone-b": {t0, t1},
+		"zone-c": {t1},
+	}
+	for _, ing := range ingesters {
+		ing.Lock()
+		ing.timeseries = map[uint32]*mimirpb.PreallocTimeseries{}
+		for i := 0; i < numSeries; i++ {
+			metricName := fmt.Sprintf("migration_test_%d", i)
+			lbls := mimirpb.FromLabelsToLabelAdapters(labels.FromStrings(model.MetricNameLabel, metricName))
+			var samples []mimirpb.Sample
+			for _, ts := range seedByZone[ing.zone] {
+				v := float64(i)
+				if ts == t1 {
+					v += 100
+				}
+				samples = append(samples, mimirpb.Sample{TimestampMs: ts, Value: v})
+			}
+			hash := mimirpb.ShardByAllLabelAdapters(orgID, lbls)
+			ing.timeseries[hash] = &mimirpb.PreallocTimeseries{
+				TimeSeries: &mimirpb.TimeSeries{Labels: lbls, Samples: samples},
+			}
+		}
+		ing.Unlock()
+	}
+
+	// QueryStream must merge across ingesters and return both samples.
+	queryCtx := limiter.ContextWithNewUnlimitedMemoryConsumptionTracker(ctx)
+	queryCtx = api.ContextWithReadConsistencyLevel(queryCtx, api.ReadConsistencyStrong)
+	queryMetrics := stats.NewQueryMetrics(reg[0])
+	matchers := labels.MustNewMatcher(labels.MatchRegexp, model.MetricNameLabel, "migration_test_.*")
+
+	res, err := d.QueryStream(queryCtx, queryMetrics, model.Time(t0), model.Time(t1), matchers)
+	require.NoError(t, err)
+	require.Len(t, res.StreamingSeries, numSeries, "expected %d series back from QueryStream", numSeries)
+
+	for _, series := range res.StreamingSeries {
+		require.GreaterOrEqual(t, len(series.Sources), 2, "series %s: must be merged from ≥2 ingesters", series.Labels)
+		allSamples := collectSamplesFromSources(t, series, model.Time(t0), model.Time(t1))
+		require.Len(t, allSamples, 2, "series %s: expected 2 samples, got %d", series.Labels, len(allSamples))
+		assert.Equal(t, model.Time(t0), allSamples[0].Timestamp, "series %s: first sample should be at t0", series.Labels)
+		assert.Equal(t, model.Time(t1), allSamples[1].Timestamp, "series %s: second sample should be at t1", series.Labels)
+	}
+}
+
+// TestDistributor_PartitionRingWithoutKafka_FlipFlopQueryContinuity verifies that a series whose
+// samples alternate between classic routing (WP=0) and partition routing (WP=100) — as happens
+// during a gradual distributor rollout — can still be queried back as a single continuous series.
+//
+// After exercising the push path with 4 alternating routing modes, we manually seed ingesters with
+// a quorum-safe distribution. Each sample is placed on exactly 2 of 3 zones so that every possible
+// 2-zone read quorum sees the complete series, and each zone holds strictly fewer than all samples,
+// forcing QueryStream to merge across ingesters.
+func TestDistributor_PartitionRingWithoutKafka_FlipFlopQueryContinuity(t *testing.T) {
+	const (
+		numSeries = 5
+		orgID     = "test"
+	)
+
+	t0 := int64(1_000_000)
+	t1 := t0 + 60_000
+	t2 := t1 + 60_000
+	t3 := t2 + 60_000
+
+	distributors, ingesters, reg, _ := prepare(t, prepConfig{
+		numDistributors: 1,
+		ingesterStateByZone: map[string]ingesterZoneState{
+			"zone-a": {numIngesters: 1, happyIngesters: 1},
+			"zone-b": {numIngesters: 1, happyIngesters: 1},
+			"zone-c": {numIngesters: 1, happyIngesters: 1},
+		},
+		ingesterIngestionType:   ingesterIngestionTypeGRPC,
+		ingestStorageEnabled:    true,
+		ingestStoragePartitions: 1,
+		limits:                  prepareDefaultLimits(),
+		configure: func(cfg *Config) {
+			cfg.IngestStorageConfig.KafkaConfig.Enabled = false
+			cfg.IngestStorageConfig.KafkaConfig.Address = ""
+			cfg.IngestStorageConfig.Migration.WritePercentage = 0
+		},
+	})
+	require.Len(t, distributors, 1)
+	d := distributors[0]
+
+	ctx := user.InjectOrgID(context.Background(), orgID)
+
+	pushAt := func(ts int64, value float64) {
+		req := &mimirpb.WriteRequest{}
+		for i := 0; i < numSeries; i++ {
+			req.Timeseries = append(req.Timeseries, makeTimeseries(
+				[]string{model.MetricNameLabel, fmt.Sprintf("flipflop_test_%d", i)},
+				makeSamples(ts, value+float64(i)),
+				nil, nil,
+			))
+		}
+		_, err := d.Push(ctx, req)
+		require.NoError(t, err)
+	}
+
+	// Push 4 rounds alternating classic ↔ partition routing to simulate a gradual rollout.
+	d.cfg.IngestStorageConfig.Migration.WritePercentage = 0   // classic
+	pushAt(t0, 0)
+	d.cfg.IngestStorageConfig.Migration.WritePercentage = 100 // partition
+	pushAt(t1, 100)
+	d.cfg.IngestStorageConfig.Migration.WritePercentage = 0   // classic
+	pushAt(t2, 200)
+	d.cfg.IngestStorageConfig.Migration.WritePercentage = 100 // partition
+	pushAt(t3, 300)
+
+	// Seed ingesters with a quorum-safe distribution. Each sample is on exactly 2 zones;
+	// every pair of zones covers all 4 samples:
+	//
+	//   zone-a: {t0, t1}         →  3 samples total
+	//   zone-b: {t0, t2, t3}     →  3 samples total
+	//   zone-c: {t1, t2, t3}     →  3 samples total
+	//
+	//   {a,b} → {t0,t1} ∪ {t0,t2,t3} = {t0,t1,t2,t3} ✓
+	//   {a,c} → {t0,t1} ∪ {t1,t2,t3} = {t0,t1,t2,t3} ✓
+	//   {b,c} → {t0,t2,t3} ∪ {t1,t2,t3} = {t0,t1,t2,t3} ✓
+	//
+	// No zone has all 4 → QueryStream must merge across ingesters.
+	seedByZone := map[string][]int64{
+		"zone-a": {t0, t1},
+		"zone-b": {t0, t2, t3},
+		"zone-c": {t1, t2, t3},
+	}
+	valueAt := map[int64]float64{t0: 0, t1: 100, t2: 200, t3: 300}
+	for _, ing := range ingesters {
+		ing.Lock()
+		ing.timeseries = map[uint32]*mimirpb.PreallocTimeseries{}
+		for i := 0; i < numSeries; i++ {
+			metricName := fmt.Sprintf("flipflop_test_%d", i)
+			lbls := mimirpb.FromLabelsToLabelAdapters(labels.FromStrings(model.MetricNameLabel, metricName))
+			var samples []mimirpb.Sample
+			for _, ts := range seedByZone[ing.zone] {
+				samples = append(samples, mimirpb.Sample{
+					TimestampMs: ts,
+					Value:       valueAt[ts] + float64(i),
+				})
+			}
+			hash := mimirpb.ShardByAllLabelAdapters(orgID, lbls)
+			ing.timeseries[hash] = &mimirpb.PreallocTimeseries{
+				TimeSeries: &mimirpb.TimeSeries{Labels: lbls, Samples: samples},
+			}
+		}
+		ing.Unlock()
+	}
+
+	// QueryStream must merge across ≥2 ingesters to reconstruct the full series.
+	queryCtx := limiter.ContextWithNewUnlimitedMemoryConsumptionTracker(ctx)
+	queryCtx = api.ContextWithReadConsistencyLevel(queryCtx, api.ReadConsistencyStrong)
+	queryMetrics := stats.NewQueryMetrics(reg[0])
+	matchers := labels.MustNewMatcher(labels.MatchRegexp, model.MetricNameLabel, "flipflop_test_.*")
+
+	res, err := d.QueryStream(queryCtx, queryMetrics, model.Time(t0), model.Time(t3), matchers)
+	require.NoError(t, err)
+	require.Len(t, res.StreamingSeries, numSeries, "expected %d series back from QueryStream", numSeries)
+
+	for _, series := range res.StreamingSeries {
+		require.GreaterOrEqual(t, len(series.Sources), 2, "series %s: must be merged from ≥2 ingesters", series.Labels)
+		allSamples := collectSamplesFromSources(t, series, model.Time(t0), model.Time(t3))
+		require.Len(t, allSamples, 4, "series %s: expected 4 samples, got %d", series.Labels, len(allSamples))
+		assert.Equal(t, model.Time(t0), allSamples[0].Timestamp, "series %s: sample 0 should be t0", series.Labels)
+		assert.Equal(t, model.Time(t1), allSamples[1].Timestamp, "series %s: sample 1 should be t1", series.Labels)
+		assert.Equal(t, model.Time(t2), allSamples[2].Timestamp, "series %s: sample 2 should be t2", series.Labels)
+		assert.Equal(t, model.Time(t3), allSamples[3].Timestamp, "series %s: sample 3 should be t3", series.Labels)
+	}
+}
+
+// collectSamplesFromSources decodes all float samples from a StreamingSeries across all source
+// ingesters, deduplicates by timestamp (overlapping zones in a quorum may both have a sample),
+// and returns them sorted by timestamp.
+func collectSamplesFromSources(t *testing.T, series client.StreamingSeries, from, through model.Time) []model.SamplePair {
+	t.Helper()
+	seen := map[model.Time]struct{}{}
+	var allSamples []model.SamplePair
+	for _, source := range series.Sources {
+		wireChunks, err := source.StreamReader.GetChunks(source.SeriesIndex)
+		require.NoError(t, err)
+
+		chunks, err := client.FromChunks(series.Labels, wireChunks)
+		require.NoError(t, err)
+
+		for i := range chunks {
+			samples, _, err := chunks[i].Samples(from, through)
+			require.NoError(t, err)
+			for _, s := range samples {
+				if _, ok := seen[s.Timestamp]; !ok {
+					seen[s.Timestamp] = struct{}{}
+					allSamples = append(allSamples, s)
+				}
+			}
+		}
+	}
+	sort.Slice(allSamples, func(i, j int) bool {
+		return allSamples[i].Timestamp < allSamples[j].Timestamp
+	})
+	return allSamples
 }
