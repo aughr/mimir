@@ -497,9 +497,9 @@ func TestPartitionRingWithoutKafkaMigrationQueryContinuity(t *testing.T) {
 			"metric %s: expected 2 samples (one classic, one partition) stitched into a single series, got %d",
 			metricName, len(matrix[0].Values))
 
-		assert.Equal(t, model.SampleValue(float64(i)+1.0), matrix[0].Values[0].V,
+		assert.Equal(t, model.SampleValue(float64(i)+1.0), matrix[0].Values[0].Value,
 			"metric %s: sample at t0 (classic path) value mismatch", metricName)
-		assert.Equal(t, model.SampleValue(float64(i)+101.0), matrix[0].Values[1].V,
+		assert.Equal(t, model.SampleValue(float64(i)+101.0), matrix[0].Values[1].Value,
 			"metric %s: sample at t1 (partition path) value mismatch", metricName)
 	}
 }
@@ -623,7 +623,7 @@ func TestPartitionRingWithoutKafkaFlipFlopRouting(t *testing.T) {
 			metricName, len(matrix[0].Values))
 
 		for j := 0; j < 4; j++ {
-			assert.Equal(t, model.SampleValue(exp.values[j]), matrix[0].Values[j].V,
+			assert.Equal(t, model.SampleValue(exp.values[j]), matrix[0].Values[j].Value,
 				"metric %s sample %d (written via %s): value mismatch", metricName, j, pathNames[j])
 		}
 	}
