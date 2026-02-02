@@ -844,12 +844,19 @@ func TestApplyStrictQuorum(t *testing.T) {
 
 	for testName, testData := range tests {
 		t.Run(testName, func(t *testing.T) {
-			// Instances don't affect quorum calculation anymore - RF does.
-			// Create some dummy instances for the ReplicationSet.
+			// Create one instance per zone up to RF — this is the "all zones healthy"
+			// scenario that applyStrictQuorum should handle identically to the old RF-only
+			// formula.
+			instances := make([]ring.InstanceDesc, testData.replicationFactor)
+			for i := range instances {
+				instances[i] = ring.InstanceDesc{
+					Addr: fmt.Sprintf("instance-%d", i),
+					Zone: fmt.Sprintf("zone-%d", i),
+				}
+			}
+
 			rs := ring.ReplicationSet{
-				Instances: []ring.InstanceDesc{
-					{Addr: "instance-1", Zone: "zone-a"},
-				},
+				Instances:            instances,
 				MaxUnavailableZones:  100, // Set to high value to ensure it gets overwritten
 				ZoneAwarenessEnabled: true,
 			}
@@ -966,11 +973,18 @@ func TestDistributor_Query_ReadsFromAllPartitions(t *testing.T) {
 
 	for testName, testData := range tests {
 		t.Run(testName, func(t *testing.T) {
+			// Populate one instance per zone up to RF — the normal scenario.
+			instances := make([]ring.InstanceDesc, testData.replicationFactor)
+			for i := range instances {
+				instances[i] = ring.InstanceDesc{
+					Addr: fmt.Sprintf("instance-%d", i),
+					Zone: fmt.Sprintf("zone-%d", i),
+				}
+			}
+
 			rs := ring.ReplicationSet{
-				Instances: []ring.InstanceDesc{
-					{Addr: "instance-1", Zone: "zone-a"},
-				},
-				MaxUnavailableZones:  testData.replicationFactor, // Will be adjusted by applyStrictQuorum
+				Instances:            instances,
+				MaxUnavailableZones:  testData.replicationFactor,
 				ZoneAwarenessEnabled: true,
 			}
 
@@ -1013,10 +1027,17 @@ func TestDistributor_Migration_QueryAllIngestersDuringMigration(t *testing.T) {
 
 	for testName, testData := range tests {
 		t.Run(testName, func(t *testing.T) {
+			// Populate one instance per zone up to RF for the strict-quorum path.
+			instances := make([]ring.InstanceDesc, testData.replicationFactor)
+			for i := range instances {
+				instances[i] = ring.InstanceDesc{
+					Addr: fmt.Sprintf("instance-%d", i),
+					Zone: fmt.Sprintf("zone-%d", i),
+				}
+			}
+
 			rs := ring.ReplicationSet{
-				Instances: []ring.InstanceDesc{
-					{Addr: "instance-1", Zone: "zone-a"},
-				},
+				Instances:            instances,
 				MaxUnavailableZones:  100, // High value simulating classic ring
 				ZoneAwarenessEnabled: true,
 			}

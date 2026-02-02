@@ -170,21 +170,33 @@ func (d *Distributor) getIngesterReplicationSetsForQuery(ctx context.Context) ([
 }
 
 // applyStrictQuorum adjusts the MaxUnavailableZones in a ReplicationSet to use quorum semantics.
-// This is used when Kafka is disabled to ensure reads query 2 of 3 zones (or quorum of N zones).
-// Uses ReplicationFactor as the expected zone count to match classic ring behavior.
-// Formula: MaxUnavailableZones = RF - ((RF / 2) + 1)
-// With RF=3: 3 - (3/2 + 1) = 3 - 2 = 1 → need 2 zones
-// With RF=5: 5 - (5/2 + 1) = 5 - 3 = 2 → need 3 zones
+// This is used when Kafka is disabled to ensure reads query enough zones to maintain consistency
+// with the write quorum.
+//
+// The calculation uses min(RF, actual unique zones in the ReplicationSet) as the effective zone
+// count.  GetReplicationSetsForOperation may filter out unhealthy instances, so the set can have
+// fewer zones than RF.  Using bare RF would allow reads to succeed with only 1 zone when 2 zones
+// are present, breaking the quorum-intersection property with the write path (which requires
+// ceil(N/2)+1 zones).
+//
+// With 3 effective zones: quorum = 2, MaxUnavailable = 1  (need 2 of 3)
+// With 2 effective zones: quorum = 2, MaxUnavailable = 0  (need 2 of 2)
+// With 1 effective zone:  quorum = 1, MaxUnavailable = 0  (need 1 of 1)
 func applyStrictQuorum(rs ring.ReplicationSet, replicationFactor int) ring.ReplicationSet {
-	if replicationFactor <= 1 {
-		// Single zone: no quorum possible, need all instances.
+	// Count the unique zones actually present in this ReplicationSet.
+	zones := make(map[string]struct{}, len(rs.Instances))
+	for _, inst := range rs.Instances {
+		zones[inst.Zone] = struct{}{}
+	}
+	effectiveZones := min(replicationFactor, len(zones))
+
+	if effectiveZones <= 1 {
 		rs.MaxUnavailableZones = 0
 		return rs
 	}
 
-	// Calculate quorum based on ReplicationFactor: (RF / 2) + 1 zones must respond.
-	quorum := (replicationFactor / 2) + 1
-	rs.MaxUnavailableZones = replicationFactor - quorum
+	quorum := (effectiveZones / 2) + 1
+	rs.MaxUnavailableZones = effectiveZones - quorum
 
 	return rs
 }

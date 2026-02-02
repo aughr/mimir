@@ -2163,6 +2163,19 @@ func (d *Distributor) push(ctx context.Context, pushReq *Request) error {
 	// Handle WritePercentage-based migration: when WritePercentage is between 0 and 100 exclusive,
 	// we need to split series between classic and partition paths based on hash.
 	writePercentage := d.cfg.IngestStorageConfig.Migration.WritePercentage
+
+	// When Kafka is disabled and WP=0, force classic routing.  Per the design doc,
+	// WP=0 means "no writes go to the partition path yet" — this is also the rollback
+	// configuration.  Without this guard, ingestersSubring stays nil (the condition at
+	// line 2159 is false when DistributorSendToIngestersEnabled is false) and
+	// sendWriteRequestToBackends unconditionally routes to partitions.
+	if d.cfg.IngestStorageConfig.Enabled && !d.cfg.IngestStorageConfig.KafkaConfig.Enabled && writePercentage == 0 {
+		if ingestersSubring == nil {
+			ingestersSubring = d.ingestersRing.ShuffleShard(userID, d.limits.IngestionTenantShardSize(userID))
+		}
+		partitionsSubring = nil
+	}
+
 	if d.cfg.IngestStorageConfig.Enabled && writePercentage > 0 && writePercentage < 100 {
 		// We need both paths for split routing.
 		if ingestersSubring == nil {
@@ -2454,6 +2467,9 @@ func (d *Distributor) sendWriteRequestToPartitions(ctx context.Context, tenantID
 	if !d.cfg.IngestStorageConfig.KafkaConfig.Enabled {
 		healthySet, err := d.ingestersRing.GetAllHealthy(ring.Write)
 		if err != nil {
+			// Call Cleanup before returning: DoBatchWithOptions normally guarantees
+			// that Cleanup is always invoked, but this early return bypasses it.
+			batchOptions.Cleanup()
 			return errors.Wrap(err, "send data to partitions")
 		}
 		healthyByID = make(map[string]ring.InstanceDesc, len(healthySet.Instances))
@@ -2539,8 +2555,20 @@ func (d *Distributor) writeToPartitionOwners(ctx context.Context, partitionID in
 	}
 
 	// Write to owners with quorum using the Do method.
+	//
+	// ReplicationSet.Do returns as soon as zone-aware quorum is reached, orphaning
+	// goroutines for the remaining zones.  Those goroutines may still be marshaling
+	// req via c.Push — and req contains unsafeMutableStrings backed by a pooled
+	// buffer that the caller will recycle via Cleanup once this function returns.
+	// The WaitGroup ensures all goroutines finish reading req before we return,
+	// so the buffer is safe to recycle.
+	var wg sync.WaitGroup
+	wg.Add(len(replicationSet.Instances))
+
 	startTime := time.Now()
 	_, err := replicationSet.Do(ctx, 0, func(ctx context.Context, ingester *ring.InstanceDesc) (any, error) {
+		defer wg.Done()
+
 		client, err := d.ingesterPool.GetClientForInstance(*ingester)
 		if err != nil {
 			return nil, err
@@ -2557,6 +2585,9 @@ func (d *Distributor) writeToPartitionOwners(ctx context.Context, partitionID in
 
 		return nil, err
 	})
+
+	// Block until every goroutine (including orphaned ones) has finished reading req.
+	wg.Wait()
 	d.partitionWriteLatencySeconds.WithLabelValues(strconv.Itoa(int(partitionID))).Observe(time.Since(startTime).Seconds())
 
 	if err != nil {
@@ -2591,25 +2622,37 @@ func (d *Distributor) updatePartitionMetrics() {
 		return
 	}
 
-	now := time.Now()
 	partitions := partitionRing.Partitions()
-	instanceRing := d.partitionsRing.InstanceRing()
+
+	// Use GetAllHealthy to determine healthy ingesters, matching the write path
+	// (sendWriteRequestToPartitions).  The ring's internal HeartbeatTimeout is used,
+	// which is typically 1 min — consistent with write-path health checks.
+	// Previously this used d.cfg.PoolConfig.RemoteTimeout (default 2s), causing the
+	// metric to report nearly all ingesters as unhealthy.
+	healthySet, err := d.ingestersRing.GetAllHealthy(ring.Write)
+	healthyByID := make(map[string]bool, len(healthySet.Instances))
+	if err == nil {
+		for _, inst := range healthySet.Instances {
+			healthyByID[inst.Id] = true
+		}
+	}
+
+	// Reset both metrics before re-populating so that labels for partitions that
+	// have been removed from the ring do not persist with stale values.
+	d.partitionState.Reset()
+	d.partitionHealthyOwners.Reset()
 
 	for _, partition := range partitions {
 		partitionIDStr := strconv.Itoa(int(partition.Id))
 
-		// Update partition state metric
 		d.partitionState.WithLabelValues(partitionIDStr).Set(float64(partition.State))
 
-		// Count healthy owners for this partition
+		// Count healthy owners for this partition using the same healthy set
+		// that the write path would use.
 		ownerIDs := partitionRing.PartitionOwnerIDs(partition.Id)
 		healthyCount := 0
 		for _, ownerID := range ownerIDs {
-			instance, err := instanceRing.GetInstance(ownerID)
-			if err != nil {
-				continue
-			}
-			if instance.IsHealthy(ring.Write, d.cfg.PoolConfig.RemoteTimeout, now) {
+			if healthyByID[ownerID] {
 				healthyCount++
 			}
 		}
