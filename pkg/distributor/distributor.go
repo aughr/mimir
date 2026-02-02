@@ -2251,9 +2251,11 @@ func (d *Distributor) sendWriteRequestToBackends(ctx context.Context, tenantID s
 
 	// Keep it easy if there's only 1 backend to write to.
 	if partitionsSubring == nil {
+		d.writePathRequests.WithLabelValues("classic").Inc()
 		return d.sendWriteRequestToIngesters(ctx, ingestersSubring, req, keys, initialMetadataIndex, remoteRequestContext, batchOptions)
 	}
 	if ingestersSubring == nil {
+		d.writePathRequests.WithLabelValues("partition").Inc()
 		return d.sendWriteRequestToPartitions(ctx, tenantID, partitionsSubring, req, keys, initialMetadataIndex, partitionsRequestContext, batchOptions)
 	}
 
@@ -2272,12 +2274,14 @@ func (d *Distributor) sendWriteRequestToBackends(ctx context.Context, tenantID s
 	go func() {
 		defer wg.Done()
 
+		d.writePathRequests.WithLabelValues("classic").Inc()
 		ingestersErr = d.sendWriteRequestToIngesters(ctx, ingestersSubring, req, keys, initialMetadataIndex, remoteRequestContext, batchOptions)
 	}()
 
 	go func() {
 		defer wg.Done()
 
+		d.writePathRequests.WithLabelValues("partition").Inc()
 		partitionsErr = d.sendWriteRequestToPartitions(ctx, tenantID, partitionsSubring, req, keys, initialMetadataIndex, partitionsRequestContext, batchOptions)
 	}()
 
