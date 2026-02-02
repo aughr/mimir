@@ -635,20 +635,33 @@ func TestPartitionRingWithoutKafkaFlipFlopRouting(t *testing.T) {
 	}
 	expectations := make(map[string]sampleExpectation, numSeries)
 
+	// Pre-compute expected values.
 	for i := 0; i < numSeries; i++ {
 		metricName := fmt.Sprintf("flipflop_series_%d", i)
 		var exp sampleExpectation
 		for j := 0; j < 4; j++ {
 			exp.values[j] = float64(i*10 + j + 1) // distinct per series and per sample
-			res, err := clients[j].Push([]prompb.TimeSeries{{
-				Labels:  []prompb.Label{{Name: "__name__", Value: metricName}},
-				Samples: []prompb.Sample{{Value: exp.values[j], Timestamp: e2e.TimeToMilliseconds(timestamps[j])}},
-			}})
-			require.NoError(t, err)
-			require.Equal(t, 200, res.StatusCode,
-				"push of %s sample %d via %s failed", metricName, j, pathNames[j])
 		}
 		expectations[metricName] = exp
+	}
+
+	// Push in timestamp-major order, one batch per timestamp, so the TSDB head
+	// advances monotonically.  With block-ranges-period=1m the head rejects samples
+	// older than MaxTime-30s; a series-major loop would advance the head to `now` on
+	// the first series, causing all subsequent series' earliest samples to fail.
+	for j := 0; j < 4; j++ {
+		batch := make([]prompb.TimeSeries, 0, numSeries)
+		for i := 0; i < numSeries; i++ {
+			metricName := fmt.Sprintf("flipflop_series_%d", i)
+			batch = append(batch, prompb.TimeSeries{
+				Labels:  []prompb.Label{{Name: "__name__", Value: metricName}},
+				Samples: []prompb.Sample{{Value: expectations[metricName].values[j], Timestamp: e2e.TimeToMilliseconds(timestamps[j])}},
+			})
+		}
+		res, err := clients[j].Push(batch)
+		require.NoError(t, err)
+		require.Equal(t, 200, res.StatusCode,
+			"push of sample %d via %s failed", j, pathNames[j])
 	}
 
 	// --- Assertion: range query stitches all four samples into one series ---
