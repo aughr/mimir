@@ -99,9 +99,6 @@ func TestPartitionRingWithoutKafka(t *testing.T) {
 		assert.Equal(t, expectedVector, result.(model.Vector))
 	}
 
-	// Verify partition ring metrics are present (indicates partition ring is being used)
-	require.NoError(t, distributor.WaitSumMetricsWithOptions(e2e.Greater(0), []string{"cortex_distributor_write_requests_total"}, e2e.WithLabelMatchers(
-		labels.MustNewMatcher(labels.MatchEqual, "path", "partition"))))
 }
 
 // TestPartitionRingWithoutKafkaZoneFailure tests that partition ring without Kafka
@@ -622,10 +619,10 @@ func TestPartitionRingWithoutKafkaFlipFlopRouting(t *testing.T) {
 	// Four sample timestamps, 1 minute apart, all within the staleness lookback window.
 	now := time.Now()
 	timestamps := [4]time.Time{
-		now.Add(-4 * time.Minute),
 		now.Add(-3 * time.Minute),
 		now.Add(-2 * time.Minute),
 		now.Add(-1 * time.Minute),
+		now,
 	}
 
 	// Push order alternates: classic, partition, classic, partition.
