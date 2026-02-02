@@ -2483,26 +2483,27 @@ func (d *Distributor) writeToPartitionOwners(ctx context.Context, partitionID in
 		return fmt.Errorf("partition %d: no owners registered", partitionID)
 	}
 
-	// Resolve owner IDs to InstanceDesc via the ingester ring.
-	now := time.Now()
+	// Get healthy ingesters from the ingester ring.  This uses the ring's configured
+	// heartbeat timeout, which is the correct value for liveness checks.
+	healthySet, err := d.ingestersRing.GetAllHealthy(ring.Write)
+	if err != nil {
+		return fmt.Errorf("partition %d: failed to get healthy ingesters: %w", partitionID, err)
+	}
+	healthyByID := make(map[string]ring.InstanceDesc, len(healthySet.Instances))
+	for _, inst := range healthySet.Instances {
+		healthyByID[inst.Id] = inst
+	}
+
+	// Filter partition owners against healthy ingesters and track zone coverage.
 	instances := make([]ring.InstanceDesc, 0, len(ownerIDs))
 	healthyZones := make(map[string]bool)
-
-	instanceRing := d.partitionsRing.InstanceRing()
 	for _, ownerID := range ownerIDs {
-		instance, err := instanceRing.GetInstance(ownerID)
-		if err != nil {
-			// Owner not in ingester ring, skip (could be removed due to crash).
+		inst, ok := healthyByID[ownerID]
+		if !ok {
 			continue
 		}
-
-		if !instance.IsHealthy(ring.Write, d.cfg.PoolConfig.RemoteTimeout, now) {
-			// Owner unhealthy, skip.
-			continue
-		}
-
-		instances = append(instances, instance)
-		healthyZones[instance.Zone] = true
+		instances = append(instances, inst)
+		healthyZones[inst.Zone] = true
 	}
 
 	// Use ReplicationFactor as the expected zone count.
@@ -2531,7 +2532,7 @@ func (d *Distributor) writeToPartitionOwners(ctx context.Context, partitionID in
 
 	// Write to owners with quorum using the Do method.
 	startTime := time.Now()
-	_, err := replicationSet.Do(ctx, 0, func(ctx context.Context, ingester *ring.InstanceDesc) (any, error) {
+	_, err = replicationSet.Do(ctx, 0, func(ctx context.Context, ingester *ring.InstanceDesc) (any, error) {
 		client, err := d.ingesterPool.GetClientForInstance(*ingester)
 		if err != nil {
 			return nil, err
