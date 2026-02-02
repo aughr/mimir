@@ -867,6 +867,77 @@ func TestApplyStrictQuorum(t *testing.T) {
 	}
 }
 
+// TestApplyStrictQuorum_BUG023_AccountsForActualZoneCount verifies that applyStrictQuorum
+// caps MaxUnavailableZones based on the actual number of unique zones in the ReplicationSet,
+// not just the ReplicationFactor.
+// BUG-023: With RF=3 and only 2 zones present (one filtered as unhealthy), the current code
+// computes MaxUnavailableZones = RF - quorum = 3 - 2 = 1. This allows reads to succeed with
+// only 1 zone responding — breaking quorum intersection with the write path which requires
+// both remaining zones when a zone is down.
+func TestApplyStrictQuorum_BUG023_AccountsForActualZoneCount(t *testing.T) {
+	tests := map[string]struct {
+		replicationFactor     int
+		instances             []ring.InstanceDesc
+		expectedMaxUnavailable int
+	}{
+		"RF=3 with only 2 zones present — both zones must respond for consistency": {
+			replicationFactor: 3,
+			instances: []ring.InstanceDesc{
+				{Addr: "zone-b-0", Zone: "zone-b"},
+				{Addr: "zone-c-0", Zone: "zone-c"},
+			},
+			// Write quorum with 2 healthy zones: MaxUnavailableZones=0 (both must ACK).
+			// Read quorum must match: also 0.
+			// BUG: current code returns 1 (RF-based, ignoring actual zone count).
+			expectedMaxUnavailable: 0,
+		},
+		"RF=3 with all 3 zones present — normal 2-of-3 quorum": {
+			replicationFactor: 3,
+			instances: []ring.InstanceDesc{
+				{Addr: "zone-a-0", Zone: "zone-a"},
+				{Addr: "zone-b-0", Zone: "zone-b"},
+				{Addr: "zone-c-0", Zone: "zone-c"},
+			},
+			expectedMaxUnavailable: 1,
+		},
+		"RF=5 with only 3 zones present — all 3 must respond": {
+			replicationFactor: 5,
+			instances: []ring.InstanceDesc{
+				{Addr: "zone-a-0", Zone: "zone-a"},
+				{Addr: "zone-b-0", Zone: "zone-b"},
+				{Addr: "zone-c-0", Zone: "zone-c"},
+			},
+			// min(5,3)=3 effective zones, quorum=(3/2)+1=2, MaxUnavailable=3-2=1.
+			// BUG: current code computes from RF=5: quorum=3, MaxUnavailable=5-3=2.
+			expectedMaxUnavailable: 1,
+		},
+		"RF=3 with 1 zone present — must require that single zone": {
+			replicationFactor: 3,
+			instances: []ring.InstanceDesc{
+				{Addr: "zone-a-0", Zone: "zone-a"},
+			},
+			// Only 1 zone: effectiveZones=1 ≤ 1, so MaxUnavailable=0.
+			// BUG: current code returns 1 (RF=3 based).
+			expectedMaxUnavailable: 0,
+		},
+	}
+
+	for testName, tc := range tests {
+		t.Run(testName, func(t *testing.T) {
+			rs := ring.ReplicationSet{
+				Instances:            tc.instances,
+				MaxUnavailableZones:  100, // Will be overwritten
+				ZoneAwarenessEnabled: true,
+			}
+
+			result := applyStrictQuorum(rs, tc.replicationFactor)
+
+			assert.Equal(t, tc.expectedMaxUnavailable, result.MaxUnavailableZones,
+				"MaxUnavailableZones should account for actual zones in ReplicationSet, not just RF")
+		})
+	}
+}
+
 // TestDistributor_Query_ReadsFromAllPartitions verifies that queries go to ALL active partitions,
 // not per-series routing. This is essential for correct query results when data may be spread
 // across multiple partitions.
