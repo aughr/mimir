@@ -2443,6 +2443,21 @@ func (d *Distributor) sendWriteRequestToIngesters(ctx context.Context, tenantRin
 }
 
 func (d *Distributor) sendWriteRequestToPartitions(ctx context.Context, tenantID string, tenantRing ring.DoBatchRing, req *mimirpb.WriteRequest, keys []uint32, initialMetadataIndex int, remoteRequestContext func() context.Context, batchOptions ring.DoBatchOptions) error {
+	// When Kafka is disabled we write directly to partition owners.  Build the
+	// healthy-ingester map once here so that writeToPartitionOwners (called once
+	// per partition inside DoBatch) doesn't repeat the ring scan.
+	var healthyByID map[string]ring.InstanceDesc
+	if !d.cfg.IngestStorageConfig.KafkaConfig.Enabled {
+		healthySet, err := d.ingestersRing.GetAllHealthy(ring.Write)
+		if err != nil {
+			return errors.Wrap(err, "send data to partitions")
+		}
+		healthyByID = make(map[string]ring.InstanceDesc, len(healthySet.Instances))
+		for _, inst := range healthySet.Instances {
+			healthyByID[inst.Id] = inst
+		}
+	}
+
 	err := ring.DoBatchWithOptions(ctx, ring.WriteNoExtend, tenantRing, keys,
 		func(partition ring.InstanceDesc, indexes []int) error {
 			req := req.ForIndexes(indexes, initialMetadataIndex)
@@ -2457,7 +2472,7 @@ func (d *Distributor) sendWriteRequestToPartitions(ctx context.Context, tenantID
 
 			// When Kafka is disabled, write directly to partition owners (ingesters).
 			if !d.cfg.IngestStorageConfig.KafkaConfig.Enabled {
-				return d.writeToPartitionOwners(ctx, int32(partitionID), tenantID, req)
+				return d.writeToPartitionOwners(ctx, int32(partitionID), tenantID, req, healthyByID)
 			}
 
 			// Kafka is enabled: write to Kafka.
@@ -2476,22 +2491,11 @@ func (d *Distributor) sendWriteRequestToPartitions(ctx context.Context, tenantID
 // writeToPartitionOwners writes the request directly to the partition's owner ingesters
 // instead of going through Kafka. This is used when Kafka is disabled (kafka.enabled: false).
 // It requires zone-aware quorum (2 of 3 zones must ACK for the write to succeed).
-func (d *Distributor) writeToPartitionOwners(ctx context.Context, partitionID int32, tenantID string, req *mimirpb.WriteRequest) error {
+func (d *Distributor) writeToPartitionOwners(ctx context.Context, partitionID int32, tenantID string, req *mimirpb.WriteRequest, healthyByID map[string]ring.InstanceDesc) error {
 	// Get partition owner IDs from the partition ring.
 	ownerIDs := d.partitionsRing.PartitionRing().PartitionOwnerIDs(partitionID)
 	if len(ownerIDs) == 0 {
 		return fmt.Errorf("partition %d: no owners registered", partitionID)
-	}
-
-	// Get healthy ingesters from the ingester ring.  This uses the ring's configured
-	// heartbeat timeout, which is the correct value for liveness checks.
-	healthySet, err := d.ingestersRing.GetAllHealthy(ring.Write)
-	if err != nil {
-		return fmt.Errorf("partition %d: failed to get healthy ingesters: %w", partitionID, err)
-	}
-	healthyByID := make(map[string]ring.InstanceDesc, len(healthySet.Instances))
-	for _, inst := range healthySet.Instances {
-		healthyByID[inst.Id] = inst
 	}
 
 	// Filter partition owners against healthy ingesters and track zone coverage.
@@ -2532,7 +2536,7 @@ func (d *Distributor) writeToPartitionOwners(ctx context.Context, partitionID in
 
 	// Write to owners with quorum using the Do method.
 	startTime := time.Now()
-	_, err = replicationSet.Do(ctx, 0, func(ctx context.Context, ingester *ring.InstanceDesc) (any, error) {
+	_, err := replicationSet.Do(ctx, 0, func(ctx context.Context, ingester *ring.InstanceDesc) (any, error) {
 		client, err := d.ingesterPool.GetClientForInstance(*ingester)
 		if err != nil {
 			return nil, err
