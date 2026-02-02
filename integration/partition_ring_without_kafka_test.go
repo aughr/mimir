@@ -45,16 +45,19 @@ func TestPartitionRingWithoutKafka(t *testing.T) {
 		})
 	}
 
-	ingester1 := e2emimir.NewIngester("ingester-1", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-a"))
-	ingester2 := e2emimir.NewIngester("ingester-2", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-b"))
-	ingester3 := e2emimir.NewIngester("ingester-3", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-c"))
+	// All three ingesters end with "-0" so IngesterPartitionID gives them the same
+	// partition (0).  Each is in a different zone, giving partition 0 a full 3-zone
+	// ownership set and satisfying the zone-aware write quorum.
+	ingester1 := e2emimir.NewIngester("ingester-a-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-a"))
+	ingester2 := e2emimir.NewIngester("ingester-b-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-b"))
+	ingester3 := e2emimir.NewIngester("ingester-c-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-c"))
 	require.NoError(t, s.StartAndWaitReady(ingester1, ingester2, ingester3))
 
 	distributor := e2emimir.NewDistributor("distributor", consul.NetworkHTTPEndpoint(), flags)
 	querier := e2emimir.NewQuerier("querier", consul.NetworkHTTPEndpoint(), flags)
 	require.NoError(t, s.StartAndWaitReady(distributor, querier))
 
-	// Wait until distributor and querier have updated the ring.
+	// Wait until distributor and querier have updated the classic ingester ring.
 	require.NoError(t, distributor.WaitSumMetricsWithOptions(e2e.Equals(3), []string{"cortex_ring_members"}, e2e.WithLabelMatchers(
 		labels.MustNewMatcher(labels.MatchEqual, "name", "ingester"),
 		labels.MustNewMatcher(labels.MatchEqual, "state", "ACTIVE"))))
@@ -62,6 +65,13 @@ func TestPartitionRingWithoutKafka(t *testing.T) {
 	require.NoError(t, querier.WaitSumMetricsWithOptions(e2e.Equals(3), []string{"cortex_ring_members"}, e2e.WithLabelMatchers(
 		labels.MustNewMatcher(labels.MatchEqual, "name", "ingester"),
 		labels.MustNewMatcher(labels.MatchEqual, "state", "ACTIVE"))))
+
+	// Wait until partition 0 is Active in the partition ring on both distributor and querier.
+	for _, svc := range []*e2emimir.MimirService{distributor, querier} {
+		require.NoError(t, svc.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_partition_ring_partitions"}, e2e.WithLabelMatchers(
+			labels.MustNewMatcher(labels.MatchEqual, "name", "ingester-partitions"),
+			labels.MustNewMatcher(labels.MatchEqual, "state", "Active"))))
+	}
 
 	client, err := e2emimir.NewClient(distributor.HTTPEndpoint(), querier.HTTPEndpoint(), "", "", userID)
 	require.NoError(t, err)
@@ -119,13 +129,15 @@ func TestPartitionRingWithoutKafkaZoneFailure(t *testing.T) {
 		})
 	}
 
-	ingester1 := e2emimir.NewIngester("ingester-1", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-a"))
-	ingester2 := e2emimir.NewIngester("ingester-2", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-a"))
-	ingester3 := e2emimir.NewIngester("ingester-3", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-b"))
-	ingester4 := e2emimir.NewIngester("ingester-4", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-b"))
-	ingester5 := e2emimir.NewIngester("ingester-5", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-c"))
-	ingester6 := e2emimir.NewIngester("ingester-6", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-c"))
-	require.NoError(t, s.StartAndWaitReady(ingester1, ingester2, ingester3, ingester4, ingester5, ingester6))
+	// Two ingesters per zone.  Within each zone the trailing numbers are 0 and 1,
+	// so across all three zones every partition (0 and 1) has a full 3-zone owner set.
+	ingesterA0 := e2emimir.NewIngester("ingester-a-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-a"))
+	ingesterA1 := e2emimir.NewIngester("ingester-a-1", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-a"))
+	ingesterB0 := e2emimir.NewIngester("ingester-b-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-b"))
+	ingesterB1 := e2emimir.NewIngester("ingester-b-1", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-b"))
+	ingesterC0 := e2emimir.NewIngester("ingester-c-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-c"))
+	ingesterC1 := e2emimir.NewIngester("ingester-c-1", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-c"))
+	require.NoError(t, s.StartAndWaitReady(ingesterA0, ingesterA1, ingesterB0, ingesterB1, ingesterC0, ingesterC1))
 
 	distributor := e2emimir.NewDistributor("distributor", consul.NetworkHTTPEndpoint(), flags)
 	querier := e2emimir.NewQuerier("querier", consul.NetworkHTTPEndpoint(), flags)
@@ -139,6 +151,13 @@ func TestPartitionRingWithoutKafkaZoneFailure(t *testing.T) {
 	require.NoError(t, querier.WaitSumMetricsWithOptions(e2e.Equals(6), []string{"cortex_ring_members"}, e2e.WithLabelMatchers(
 		labels.MustNewMatcher(labels.MatchEqual, "name", "ingester"),
 		labels.MustNewMatcher(labels.MatchEqual, "state", "ACTIVE"))))
+
+	// Wait for both partitions (0 and 1) to be Active in the partition ring.
+	for _, svc := range []*e2emimir.MimirService{distributor, querier} {
+		require.NoError(t, svc.WaitSumMetricsWithOptions(e2e.Equals(2), []string{"cortex_partition_ring_partitions"}, e2e.WithLabelMatchers(
+			labels.MustNewMatcher(labels.MatchEqual, "name", "ingester-partitions"),
+			labels.MustNewMatcher(labels.MatchEqual, "state", "Active"))))
+	}
 
 	client, err := e2emimir.NewClient(distributor.HTTPEndpoint(), querier.HTTPEndpoint(), "", "", userID)
 	require.NoError(t, err)
@@ -167,8 +186,8 @@ func TestPartitionRingWithoutKafkaZoneFailure(t *testing.T) {
 	}
 
 	// SIGKILL all ingesters in zone-a
-	require.NoError(t, ingester1.Kill())
-	require.NoError(t, ingester2.Kill())
+	require.NoError(t, ingesterA0.Kill())
+	require.NoError(t, ingesterA1.Kill())
 
 	// Push more series - should still succeed with 2 zones available (quorum)
 	numSeries++
@@ -189,8 +208,8 @@ func TestPartitionRingWithoutKafkaZoneFailure(t *testing.T) {
 	}
 
 	// SIGKILL all ingesters in zone-b (now 2 zones are down)
-	require.NoError(t, ingester3.Kill())
-	require.NoError(t, ingester4.Kill())
+	require.NoError(t, ingesterB0.Kill())
+	require.NoError(t, ingesterB1.Kill())
 
 	// Push more series - should fail because only 1 zone is available (below quorum)
 	series, _, _ = generateFloatSeries("series_last", now)
@@ -243,16 +262,16 @@ func TestPartitionRingWithoutKafkaMigration(t *testing.T) {
 		})
 	}
 
-	ingester1 := e2emimir.NewIngester("ingester-1", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-a"))
-	ingester2 := e2emimir.NewIngester("ingester-2", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-b"))
-	ingester3 := e2emimir.NewIngester("ingester-3", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-c"))
+	ingester1 := e2emimir.NewIngester("ingester-a-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-a"))
+	ingester2 := e2emimir.NewIngester("ingester-b-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-b"))
+	ingester3 := e2emimir.NewIngester("ingester-c-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-c"))
 	require.NoError(t, s.StartAndWaitReady(ingester1, ingester2, ingester3))
 
 	distributor := e2emimir.NewDistributor("distributor", consul.NetworkHTTPEndpoint(), flags)
 	querier := e2emimir.NewQuerier("querier", consul.NetworkHTTPEndpoint(), flags)
 	require.NoError(t, s.StartAndWaitReady(distributor, querier))
 
-	// Wait until distributor and querier have updated the ring.
+	// Wait until distributor and querier have updated the classic ingester ring.
 	require.NoError(t, distributor.WaitSumMetricsWithOptions(e2e.Equals(3), []string{"cortex_ring_members"}, e2e.WithLabelMatchers(
 		labels.MustNewMatcher(labels.MatchEqual, "name", "ingester"),
 		labels.MustNewMatcher(labels.MatchEqual, "state", "ACTIVE"))))
@@ -260,6 +279,11 @@ func TestPartitionRingWithoutKafkaMigration(t *testing.T) {
 	require.NoError(t, querier.WaitSumMetricsWithOptions(e2e.Equals(3), []string{"cortex_ring_members"}, e2e.WithLabelMatchers(
 		labels.MustNewMatcher(labels.MatchEqual, "name", "ingester"),
 		labels.MustNewMatcher(labels.MatchEqual, "state", "ACTIVE"))))
+
+	// Wait for partition 0 to be Active before the first push.
+	require.NoError(t, distributor.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_partition_ring_partitions"}, e2e.WithLabelMatchers(
+		labels.MustNewMatcher(labels.MatchEqual, "name", "ingester-partitions"),
+		labels.MustNewMatcher(labels.MatchEqual, "state", "Active"))))
 
 	client, err := e2emimir.NewClient(distributor.HTTPEndpoint(), querier.HTTPEndpoint(), "", "", userID)
 	require.NoError(t, err)
@@ -318,16 +342,16 @@ func TestPartitionRingWithoutKafkaRollback(t *testing.T) {
 		})
 	}
 
-	ingester1 := e2emimir.NewIngester("ingester-1", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-a"))
-	ingester2 := e2emimir.NewIngester("ingester-2", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-b"))
-	ingester3 := e2emimir.NewIngester("ingester-3", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-c"))
+	ingester1 := e2emimir.NewIngester("ingester-a-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-a"))
+	ingester2 := e2emimir.NewIngester("ingester-b-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-b"))
+	ingester3 := e2emimir.NewIngester("ingester-c-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-c"))
 	require.NoError(t, s.StartAndWaitReady(ingester1, ingester2, ingester3))
 
 	distributor := e2emimir.NewDistributor("distributor", consul.NetworkHTTPEndpoint(), flags)
 	querier := e2emimir.NewQuerier("querier", consul.NetworkHTTPEndpoint(), flags)
 	require.NoError(t, s.StartAndWaitReady(distributor, querier))
 
-	// Wait until distributor and querier have updated the ring.
+	// Wait until distributor and querier have updated the classic ingester ring.
 	require.NoError(t, distributor.WaitSumMetricsWithOptions(e2e.Equals(3), []string{"cortex_ring_members"}, e2e.WithLabelMatchers(
 		labels.MustNewMatcher(labels.MatchEqual, "name", "ingester"),
 		labels.MustNewMatcher(labels.MatchEqual, "state", "ACTIVE"))))
@@ -335,6 +359,13 @@ func TestPartitionRingWithoutKafkaRollback(t *testing.T) {
 	require.NoError(t, querier.WaitSumMetricsWithOptions(e2e.Equals(3), []string{"cortex_ring_members"}, e2e.WithLabelMatchers(
 		labels.MustNewMatcher(labels.MatchEqual, "name", "ingester"),
 		labels.MustNewMatcher(labels.MatchEqual, "state", "ACTIVE"))))
+
+	// Wait for partition 0 to be Active in the partition ring.
+	for _, svc := range []*e2emimir.MimirService{distributor, querier} {
+		require.NoError(t, svc.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_partition_ring_partitions"}, e2e.WithLabelMatchers(
+			labels.MustNewMatcher(labels.MatchEqual, "name", "ingester-partitions"),
+			labels.MustNewMatcher(labels.MatchEqual, "state", "Active"))))
+	}
 
 	client, err := e2emimir.NewClient(distributor.HTTPEndpoint(), querier.HTTPEndpoint(), "", "", userID)
 	require.NoError(t, err)
@@ -407,9 +438,9 @@ func TestPartitionRingWithoutKafkaMigrationQueryContinuity(t *testing.T) {
 			"-ingester.ring.instance-availability-zone": zone,
 		})
 	}
-	ingester1 := e2emimir.NewIngester("ingester-1", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-a"))
-	ingester2 := e2emimir.NewIngester("ingester-2", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-b"))
-	ingester3 := e2emimir.NewIngester("ingester-3", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-c"))
+	ingester1 := e2emimir.NewIngester("ingester-a-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-a"))
+	ingester2 := e2emimir.NewIngester("ingester-b-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-b"))
+	ingester3 := e2emimir.NewIngester("ingester-c-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-c"))
 	require.NoError(t, s.StartAndWaitReady(ingester1, ingester2, ingester3))
 
 	// --- Phase 1: distributor with WritePercentage=0 (classic ingester ring) ---
@@ -426,6 +457,11 @@ func TestPartitionRingWithoutKafkaMigrationQueryContinuity(t *testing.T) {
 	require.NoError(t, querier.WaitSumMetricsWithOptions(e2e.Equals(3), []string{"cortex_ring_members"}, e2e.WithLabelMatchers(
 		labels.MustNewMatcher(labels.MatchEqual, "name", "ingester"),
 		labels.MustNewMatcher(labels.MatchEqual, "state", "ACTIVE"))))
+
+	// Partition ring must be ready before first push (WP=0 still routes through partition owners).
+	require.NoError(t, distributor.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_partition_ring_partitions"}, e2e.WithLabelMatchers(
+		labels.MustNewMatcher(labels.MatchEqual, "name", "ingester-partitions"),
+		labels.MustNewMatcher(labels.MatchEqual, "state", "Active"))))
 
 	client, err := e2emimir.NewClient(distributor.HTTPEndpoint(), querier.HTTPEndpoint(), "", "", userID)
 	require.NoError(t, err)
@@ -466,6 +502,9 @@ func TestPartitionRingWithoutKafkaMigrationQueryContinuity(t *testing.T) {
 	require.NoError(t, distributor.WaitSumMetricsWithOptions(e2e.Equals(3), []string{"cortex_ring_members"}, e2e.WithLabelMatchers(
 		labels.MustNewMatcher(labels.MatchEqual, "name", "ingester"),
 		labels.MustNewMatcher(labels.MatchEqual, "state", "ACTIVE"))))
+	require.NoError(t, distributor.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_partition_ring_partitions"}, e2e.WithLabelMatchers(
+		labels.MustNewMatcher(labels.MatchEqual, "name", "ingester-partitions"),
+		labels.MustNewMatcher(labels.MatchEqual, "state", "Active"))))
 
 	// Rebuild client to pick up the (potentially different) distributor endpoint.
 	client, err = e2emimir.NewClient(distributor.HTTPEndpoint(), querier.HTTPEndpoint(), "", "", userID)
@@ -543,9 +582,9 @@ func TestPartitionRingWithoutKafkaFlipFlopRouting(t *testing.T) {
 			"-ingester.ring.instance-availability-zone": zone,
 		})
 	}
-	ingester1 := e2emimir.NewIngester("ingester-1", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-a"))
-	ingester2 := e2emimir.NewIngester("ingester-2", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-b"))
-	ingester3 := e2emimir.NewIngester("ingester-3", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-c"))
+	ingester1 := e2emimir.NewIngester("ingester-a-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-a"))
+	ingester2 := e2emimir.NewIngester("ingester-b-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-b"))
+	ingester3 := e2emimir.NewIngester("ingester-c-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-c"))
 	require.NoError(t, s.StartAndWaitReady(ingester1, ingester2, ingester3))
 
 	// Two distributors simulating pods at different stages of a rolling rollout.
@@ -560,11 +599,18 @@ func TestPartitionRingWithoutKafkaFlipFlopRouting(t *testing.T) {
 	querier := e2emimir.NewQuerier("querier", consul.NetworkHTTPEndpoint(), baseFlags)
 	require.NoError(t, s.StartAndWaitReady(distributorClassic, distributorPartition, querier))
 
-	// Wait for ring convergence on all three components.
+	// Wait for classic ingester ring convergence on all three components.
 	for _, svc := range []*e2emimir.MimirService{distributorClassic, distributorPartition, querier} {
 		require.NoError(t, svc.WaitSumMetricsWithOptions(e2e.Equals(3), []string{"cortex_ring_members"}, e2e.WithLabelMatchers(
 			labels.MustNewMatcher(labels.MatchEqual, "name", "ingester"),
 			labels.MustNewMatcher(labels.MatchEqual, "state", "ACTIVE"))))
+	}
+
+	// Both distributors have ingest-storage enabled so they both need the partition ring ready.
+	for _, svc := range []*e2emimir.MimirService{distributorClassic, distributorPartition} {
+		require.NoError(t, svc.WaitSumMetricsWithOptions(e2e.Equals(1), []string{"cortex_partition_ring_partitions"}, e2e.WithLabelMatchers(
+			labels.MustNewMatcher(labels.MatchEqual, "name", "ingester-partitions"),
+			labels.MustNewMatcher(labels.MatchEqual, "state", "Active"))))
 	}
 
 	// Two clients, one per distributor.  Both query through the same querier.
