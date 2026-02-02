@@ -2338,12 +2338,10 @@ func TestDistributor_UpdatePartitionMetrics(t *testing.T) {
 		"partition 1 should have 3 healthy owners (owners are still healthy even if partition is inactive)")
 }
 
-// TestDistributor_BUG001_WritePercentageZeroRoutesToClassicWhenKafkaDisabled verifies that
-// WritePercentage=0 with Kafka disabled routes all writes to the classic ingester ring.
-// BUG-001: Currently partitionsSubring is set and ingestersSubring stays nil when WP=0
-// and DistributorSendToIngestersEnabled=false, so sendWriteRequestToBackends routes
-// everything to partitions instead of classic ingesters.
-func TestDistributor_BUG001_WritePercentageZeroRoutesToClassicWhenKafkaDisabled(t *testing.T) {
+// TestDistributor_WritePercentageZeroRoutesToClassicWhenKafkaDisabled verifies that
+// WritePercentage=0 with Kafka disabled routes all writes to the classic ingester ring,
+// not to partition owners.  This is the rollback / Phase 1 configuration per the design doc.
+func TestDistributor_WritePercentageZeroRoutesToClassicWhenKafkaDisabled(t *testing.T) {
 	t.Parallel()
 
 	ctx := user.InjectOrgID(context.Background(), "user")
@@ -2376,7 +2374,7 @@ func TestDistributor_BUG001_WritePercentageZeroRoutesToClassicWhenKafkaDisabled(
 
 	_, err := d.Push(ctx, &mimirpb.WriteRequest{
 		Timeseries: []mimirpb.PreallocTimeseries{
-			makeTimeseries([]string{model.MetricNameLabel, "bug001_series"}, makeSamples(now.UnixMilli(), 1), nil, nil),
+			makeTimeseries([]string{model.MetricNameLabel, "wp_zero_classic_routing"}, makeSamples(now.UnixMilli(), 1), nil, nil),
 		},
 	})
 	require.NoError(t, err)
@@ -2399,13 +2397,12 @@ func (r *errGetAllHealthyRing) GetAllHealthy(_ ring.Operation) (ring.Replication
 	return ring.ReplicationSet{}, r.err
 }
 
-// TestDistributor_BUG010_CleanupCalledWhenGetAllHealthyFails verifies that sendWriteRequestToPartitions
-// calls batchOptions.Cleanup() even when GetAllHealthy returns an error before DoBatchWithOptions.
-// BUG-010: the early return at line 2457 skips the DoBatchWithOptions call entirely, so
-// batchOptions.Cleanup() (which releases the pooled write-request buffer) is never invoked.
-// DoBatchWithOptions' own contract (batch.go:81) guarantees Cleanup is "always called" — but
-// only if DoBatch actually runs. When we return before DoBatch, the caller must call Cleanup.
-func TestDistributor_BUG010_CleanupCalledWhenGetAllHealthyFails(t *testing.T) {
+// TestDistributor_SendWriteRequestToPartitions_CleanupCalledOnGetAllHealthyError verifies that
+// sendWriteRequestToPartitions calls batchOptions.Cleanup() even when GetAllHealthy returns an
+// error before DoBatchWithOptions.  DoBatchWithOptions' contract (batch.go:81) guarantees
+// Cleanup is "always called" — but only if DoBatch actually runs.  The early-return path must
+// call Cleanup explicitly to avoid leaking the pooled write-request buffer.
+func TestDistributor_SendWriteRequestToPartitions_CleanupCalledOnGetAllHealthyError(t *testing.T) {
 	t.Parallel()
 
 	testConfig := prepConfig{
@@ -2455,18 +2452,15 @@ func TestDistributor_BUG010_CleanupCalledWhenGetAllHealthyFails(t *testing.T) {
 	)
 	require.Error(t, err, "should fail because GetAllHealthy returned ErrEmptyRing")
 
-	// BUG-010: Currently Cleanup is NOT called on the GetAllHealthy-error path.
-	// The fix must ensure Cleanup fires even when we return before DoBatchWithOptions.
 	assert.Equal(t, int64(1), cleanupCalled.Load(),
 		"batchOptions.Cleanup must be called even when GetAllHealthy fails before DoBatch")
 }
 
-// TestDistributor_BUG040_PartitionPushErrorPreservesIngesterCause verifies that when an
-// ingester returns a gRPC error with a specific ErrorCause (e.g., INGESTION_RATE_LIMITED),
-// the cause is preserved through wrapPartitionPushError and surfaces in the final gRPC response.
-// BUG-040: wrapPartitionPushError wraps with cause=UNKNOWN, shadowing the inner
-// ingesterPushError's cause. errors.As finds partitionPushError first → maps to codes.Internal (500).
-func TestDistributor_BUG040_PartitionPushErrorPreservesIngesterCause(t *testing.T) {
+// TestDistributor_PartitionPushErrorPreservesIngesterCause verifies that when an ingester
+// returns a gRPC error with a specific ErrorCause (e.g. INGESTION_RATE_LIMITED), the cause
+// is preserved through wrapPartitionPushError and surfaces in the final gRPC response as
+// the correct status code and ErrorDetails cause.
+func TestDistributor_PartitionPushErrorPreservesIngesterCause(t *testing.T) {
 	t.Parallel()
 
 	ctx := user.InjectOrgID(context.Background(), "user")
@@ -2503,14 +2497,12 @@ func TestDistributor_BUG040_PartitionPushErrorPreservesIngesterCause(t *testing.
 
 	_, err := distributors[0].Push(ctx, &mimirpb.WriteRequest{
 		Timeseries: []mimirpb.PreallocTimeseries{
-			makeTimeseries([]string{model.MetricNameLabel, "bug040_series"}, makeSamples(now.UnixMilli(), 1), nil, nil),
+			makeTimeseries([]string{model.MetricNameLabel, "partition_push_error_cause"}, makeSamples(now.UnixMilli(), 1), nil, nil),
 		},
 	})
 	require.Error(t, err)
 
 	// The error should preserve the INGESTION_RATE_LIMITED cause and map to ResourceExhausted (429).
-	// BUG-040: Currently wrapPartitionPushError sets cause=UNKNOWN, so errors.As finds
-	// partitionPushError first and maps to codes.Internal (500).
 	stat, ok := grpcutil.ErrorToStatus(err)
 	require.True(t, ok, "error should be a gRPC status error")
 
@@ -2525,14 +2517,11 @@ func TestDistributor_BUG040_PartitionPushErrorPreservesIngesterCause(t *testing.
 		"error cause should be INGESTION_RATE_LIMITED, not UNKNOWN")
 }
 
-// TestDistributor_BUG011_UpdatePartitionMetrics_UsesRingHeartbeatTimeout verifies that
-// updatePartitionMetrics uses the ring's HeartbeatTimeout (not PoolConfig.RemoteTimeout)
-// to determine ingester health, matching the write path's health check.
-// merged_bug_011: updatePartitionMetrics calls instance.IsHealthy(ring.Write,
-// d.cfg.PoolConfig.RemoteTimeout, now) but the write path uses d.ingestersRing.GetAllHealthy
-// which uses the ring's HeartbeatTimeout (default 1 min). With RemoteTimeout=2s, ingesters
-// appear unhealthy in metrics even when perfectly healthy for writes.
-func TestDistributor_BUG011_UpdatePartitionMetrics_UsesRingHeartbeatTimeout(t *testing.T) {
+// TestDistributor_UpdatePartitionMetrics_UsesRingHeartbeatTimeout verifies that
+// updatePartitionMetrics determines ingester health using the same mechanism as the write
+// path (GetAllHealthy, which uses the ring's HeartbeatTimeout), not an independent shorter
+// timeout like PoolConfig.RemoteTimeout that would cause spurious unhealthy reports.
+func TestDistributor_UpdatePartitionMetrics_UsesRingHeartbeatTimeout(t *testing.T) {
 	ctx := user.InjectOrgID(context.Background(), "user")
 	_ = ctx
 
@@ -2551,11 +2540,10 @@ func TestDistributor_BUG011_UpdatePartitionMetrics_UsesRingHeartbeatTimeout(t *t
 			cfg.IngestStorageConfig.KafkaConfig.Enabled = false
 			cfg.IngestStorageConfig.KafkaConfig.Address = ""
 			cfg.IngestStorageConfig.Migration.WritePercentage = 100
-			// Set the top-level RemoteTimeout to 1ns.  New() copies this into
-			// cfg.PoolConfig.RemoteTimeout (distributor.go:484), which is the value
-			// updatePartitionMetrics passes to IsHealthy.  Any ingester whose heartbeat
-			// is older than 1ns will appear unhealthy.  The ring's own HeartbeatTimeout
-			// is ~1 min, so ingesters SHOULD appear healthy for writes — the metric is wrong.
+			// Set RemoteTimeout to 1ns.  New() copies this into PoolConfig.RemoteTimeout.
+			// If updatePartitionMetrics were to use this value, every ingester would
+			// appear unhealthy.  The ring's HeartbeatTimeout (~1 min) should be used
+			// instead, keeping ingesters healthy.
 			cfg.RemoteTimeout = time.Nanosecond
 		},
 	}
@@ -2566,9 +2554,8 @@ func TestDistributor_BUG011_UpdatePartitionMetrics_UsesRingHeartbeatTimeout(t *t
 	d := distributors[0]
 	d.updatePartitionMetrics()
 
-	// All 3 ingesters are healthy (heartbeat just set by prepare). With the ring's HeartbeatTimeout
-	// (~1 min), all are healthy. With RemoteTimeout (1ns), all appear unhealthy.
-	// BUG-011: updatePartitionMetrics uses RemoteTimeout, so this will be 0 instead of 3.
+	// All 3 ingesters heartbeated during prepare, so GetAllHealthy (HeartbeatTimeout ~1 min)
+	// considers them healthy — even though RemoteTimeout is 1ns.
 	assert.Equal(t, float64(3), testutil.ToFloat64(d.partitionHealthyOwners.WithLabelValues("0")),
 		"all partition owners should be healthy (ring heartbeat timeout is ~1min, not RemoteTimeout)")
 }

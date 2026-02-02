@@ -874,14 +874,13 @@ func TestApplyStrictQuorum(t *testing.T) {
 	}
 }
 
-// TestApplyStrictQuorum_BUG023_AccountsForActualZoneCount verifies that applyStrictQuorum
-// caps MaxUnavailableZones based on the actual number of unique zones in the ReplicationSet,
-// not just the ReplicationFactor.
-// BUG-023: With RF=3 and only 2 zones present (one filtered as unhealthy), the current code
-// computes MaxUnavailableZones = RF - quorum = 3 - 2 = 1. This allows reads to succeed with
-// only 1 zone responding — breaking quorum intersection with the write path which requires
-// both remaining zones when a zone is down.
-func TestApplyStrictQuorum_BUG023_AccountsForActualZoneCount(t *testing.T) {
+// TestApplyStrictQuorum_AccountsForActualZoneCount verifies that applyStrictQuorum caps
+// MaxUnavailableZones based on the actual number of unique zones in the ReplicationSet,
+// not just the ReplicationFactor.  When GetReplicationSetsForOperation filters out an
+// unhealthy zone, the set has fewer zones than RF.  Using bare RF would allow reads to
+// succeed with fewer zones than the write quorum requires, breaking the quorum-intersection
+// property.
+func TestApplyStrictQuorum_AccountsForActualZoneCount(t *testing.T) {
 	tests := map[string]struct {
 		replicationFactor     int
 		instances             []ring.InstanceDesc
@@ -893,9 +892,7 @@ func TestApplyStrictQuorum_BUG023_AccountsForActualZoneCount(t *testing.T) {
 				{Addr: "zone-b-0", Zone: "zone-b"},
 				{Addr: "zone-c-0", Zone: "zone-c"},
 			},
-			// Write quorum with 2 healthy zones: MaxUnavailableZones=0 (both must ACK).
-			// Read quorum must match: also 0.
-			// BUG: current code returns 1 (RF-based, ignoring actual zone count).
+			// With 2 effective zones, quorum=2, so MaxUnavailable=0 (both must respond).
 			expectedMaxUnavailable: 0,
 		},
 		"RF=3 with all 3 zones present — normal 2-of-3 quorum": {
@@ -915,7 +912,6 @@ func TestApplyStrictQuorum_BUG023_AccountsForActualZoneCount(t *testing.T) {
 				{Addr: "zone-c-0", Zone: "zone-c"},
 			},
 			// min(5,3)=3 effective zones, quorum=(3/2)+1=2, MaxUnavailable=3-2=1.
-			// BUG: current code computes from RF=5: quorum=3, MaxUnavailable=5-3=2.
 			expectedMaxUnavailable: 1,
 		},
 		"RF=3 with 1 zone present — must require that single zone": {
@@ -923,8 +919,7 @@ func TestApplyStrictQuorum_BUG023_AccountsForActualZoneCount(t *testing.T) {
 			instances: []ring.InstanceDesc{
 				{Addr: "zone-a-0", Zone: "zone-a"},
 			},
-			// Only 1 zone: effectiveZones=1 ≤ 1, so MaxUnavailable=0.
-			// BUG: current code returns 1 (RF=3 based).
+			// Only 1 zone: effectiveZones=1, so MaxUnavailable=0.
 			expectedMaxUnavailable: 0,
 		},
 	}
