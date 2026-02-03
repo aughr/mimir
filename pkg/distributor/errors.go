@@ -326,12 +326,14 @@ var _ Error = ingesterPushError{}
 type partitionPushError struct {
 	err   error
 	cause mimirpb.ErrorCause
+	soft  bool
 }
 
-func newPartitionPushError(err error, cause mimirpb.ErrorCause) partitionPushError {
+func newPartitionPushError(err error, cause mimirpb.ErrorCause, soft bool) partitionPushError {
 	return partitionPushError{
 		err:   err,
 		cause: cause,
+		soft:  soft,
 	}
 }
 
@@ -344,7 +346,7 @@ func (e partitionPushError) Cause() mimirpb.ErrorCause {
 }
 
 func (e partitionPushError) IsSoft() bool {
-	return false
+	return e.soft
 }
 
 func (e partitionPushError) Unwrap() error {
@@ -444,22 +446,26 @@ func wrapPartitionPushError(err error, partitionID int32) error {
 	// Add the partition ID to the error message.
 	err = errors.Wrap(err, fmt.Sprintf("%s %d", failedPushingToPartitionMessage, partitionID))
 
-	// Detect the cause.  When the error wraps an ingesterPushError (the no-Kafka
-	// partition-owner write path), propagate its cause so that the final gRPC
-	// status preserves the original code (e.g. ResourceExhausted for rate limiting).
-	// Without this, the default UNKNOWN cause maps to codes.Internal (500), turning
-	// legitimate 4xx client errors into 5xx server errors.
+	// Detect the cause and soft flag.  When the error wraps an ingesterPushError
+	// (the no-Kafka partition-owner write path), propagate both its cause and its
+	// soft flag so that:
+	//   - The final gRPC status preserves the original code (e.g. ResourceExhausted
+	//     for rate limiting) instead of defaulting to codes.Internal (500).
+	//   - OTLP clients receive partial-success responses for soft errors rather
+	//     than full-failure responses that trigger unnecessary retries.
 	cause := mimirpb.ERROR_CAUSE_UNKNOWN
+	soft := false
 	if errors.Is(err, ingest.ErrWriteRequestDataItemTooLarge) {
 		cause = mimirpb.ERROR_CAUSE_BAD_DATA
 	} else {
 		var ingErr ingesterPushError
 		if errors.As(err, &ingErr) {
 			cause = ingErr.Cause()
+			soft = ingErr.IsSoft()
 		}
 	}
 
-	return newPartitionPushError(err, cause)
+	return newPartitionPushError(err, cause, soft)
 }
 
 func wrapDeadlineExceededPushError(err error) error {

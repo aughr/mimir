@@ -170,12 +170,16 @@ func TestNewIngesterPushError(t *testing.T) {
 
 func TestPartitionPushError(t *testing.T) {
 	origErr := errors.New("the original error")
-	pushErr := newPartitionPushError(origErr, mimirpb.ERROR_CAUSE_BAD_DATA)
+	pushErr := newPartitionPushError(origErr, mimirpb.ERROR_CAUSE_BAD_DATA, false)
 
 	assert.ErrorIs(t, pushErr, origErr)
 	assert.NotErrorIs(t, pushErr, context.Canceled)
 
 	assert.Equal(t, mimirpb.ERROR_CAUSE_BAD_DATA, pushErr.Cause())
+	assert.False(t, pushErr.IsSoft())
+
+	softErr := newPartitionPushError(origErr, mimirpb.ERROR_CAUSE_INGESTION_RATE_LIMITED, true)
+	assert.True(t, softErr.IsSoft())
 }
 
 func TestToErrorWithGRPCStatus(t *testing.T) {

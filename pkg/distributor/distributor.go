@@ -631,11 +631,11 @@ func New(cfg Config, clientConfig ingester_client.Config, limits *validation.Ove
 			Buckets: prometheus.DefBuckets,
 		}, []string{"partition"}),
 		partitionHealthyOwners: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
-			Name: "cortex_partition_healthy_owners",
+			Name: "cortex_distributor_partition_healthy_owners",
 			Help: "Number of healthy owners for each partition.",
 		}, []string{"partition"}),
 		partitionState: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
-			Name: "cortex_partition_state",
+			Name: "cortex_distributor_partition_state",
 			Help: "Current state of each partition (1=pending, 2=active, 3=inactive).",
 		}, []string{"partition"}),
 

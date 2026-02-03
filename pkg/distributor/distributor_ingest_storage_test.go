@@ -2517,6 +2517,47 @@ func TestDistributor_PartitionPushErrorPreservesIngesterCause(t *testing.T) {
 		"error cause should be INGESTION_RATE_LIMITED, not UNKNOWN")
 }
 
+// TestDistributor_PartitionPushErrorPreservesIngesterSoftFlag verifies that the soft flag
+// from an ingester's ErrorDetails is propagated through wrapPartitionPushError.  Soft errors
+// tell the OTLP handler (which receives the raw error via PushWithMiddlewares, before gRPC
+// status conversion) to return a partial-success response instead of a full-failure response,
+// which avoids unnecessary retries of already-accepted samples.
+func TestDistributor_PartitionPushErrorPreservesIngesterSoftFlag(t *testing.T) {
+	t.Parallel()
+
+	// Build a gRPC status error with Soft=true, matching what an ingester returns
+	// when some samples were accepted and others rejected.
+	softStatus := createSoftStatusWithDetails(t, codes.ResourceExhausted,
+		"some samples rejected", mimirpb.ERROR_CAUSE_INGESTION_RATE_LIMITED)
+	ingErr := newIngesterPushError(softStatus, "ingester-zone-a-0")
+	require.True(t, ingErr.IsSoft(), "ingesterPushError should carry the soft flag")
+
+	// Wrap through the partition-push path, as writeToPartitionOwners does.
+	wrapped := wrapPartitionPushError(ingErr, 0)
+
+	// The OTLP handler extracts the distributor.Error interface via errors.As.
+	var distErr Error
+	require.True(t, errors.As(wrapped, &distErr), "wrapped error should implement distributor.Error")
+
+	assert.Equal(t, mimirpb.ERROR_CAUSE_INGESTION_RATE_LIMITED, distErr.Cause(),
+		"cause should propagate through partitionPushError")
+	assert.True(t, distErr.IsSoft(),
+		"soft flag from ingester's ErrorDetails must propagate through partitionPushError; "+
+			"without it toOtlpGRPCHTTPStatus returns isSoft=false and OTLP clients get "+
+			"full-failure responses instead of partial-success")
+
+	// Negative case: a hard error must not become soft.
+	hardStatus := createStatusWithDetails(t, codes.ResourceExhausted,
+		"hard rejection", mimirpb.ERROR_CAUSE_INGESTION_RATE_LIMITED)
+	hardIngErr := newIngesterPushError(hardStatus, "ingester-zone-a-0")
+	require.False(t, hardIngErr.IsSoft())
+
+	hardWrapped := wrapPartitionPushError(hardIngErr, 0)
+	var hardDistErr Error
+	require.True(t, errors.As(hardWrapped, &hardDistErr))
+	assert.False(t, hardDistErr.IsSoft(), "hard errors must remain hard after wrapping")
+}
+
 // TestDistributor_UpdatePartitionMetrics_UsesRingHeartbeatTimeout verifies that
 // updatePartitionMetrics determines ingester health using the same mechanism as the write
 // path (GetAllHealthy, which uses the ring's HeartbeatTimeout), not an independent shorter
