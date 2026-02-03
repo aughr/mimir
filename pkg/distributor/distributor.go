@@ -2176,7 +2176,20 @@ func (d *Distributor) push(ctx context.Context, pushReq *Request) error {
 		partitionsSubring = nil
 	}
 
-	if d.cfg.IngestStorageConfig.Enabled && writePercentage > 0 && writePercentage < 100 {
+	// When Kafka is disabled and WP=100, force partition-only routing.  Partition
+	// owners ARE ingesters, so leaving ingestersSubring set (via
+	// DistributorSendToIngestersEnabled) would cause every series to be written
+	// twice to the same ingesters via two independent routing paths.
+	if d.cfg.IngestStorageConfig.Enabled && !d.cfg.IngestStorageConfig.KafkaConfig.Enabled && writePercentage >= 100 {
+		ingestersSubring = nil
+	}
+
+	// Percentage-based split routing: hash-route series between classic and
+	// partition paths.  Only meaningful without Kafka — when Kafka is enabled the
+	// partition path already goes through Kafka, and a partial split would let
+	// some series bypass Kafka entirely.  Config validation rejects the combination
+	// (Kafka enabled + WP 1-99), but guard here as well for defence in depth.
+	if d.cfg.IngestStorageConfig.Enabled && !d.cfg.IngestStorageConfig.KafkaConfig.Enabled && writePercentage > 0 && writePercentage < 100 {
 		// We need both paths for split routing.
 		if ingestersSubring == nil {
 			ingestersSubring = d.ingestersRing.ShuffleShard(userID, d.limits.IngestionTenantShardSize(userID))

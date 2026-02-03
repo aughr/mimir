@@ -40,7 +40,9 @@ var (
 	ErrInvalidWriteLogsFsyncConcurrency  = errors.New("the configured number of tenants to fsync concurrently before Kafka offsets are committed must be at least 1")
 	ErrInvalidWritePercentage            = errors.New("the configured write percentage must be between 0 and 100")
 	ErrPartitionIsolationRequiresFull    = errors.New("partition_isolation_enabled requires write_percentage to be 100")
-	ErrKafkaAddressWithKafkaDisabled     = errors.New("kafka.address must be empty when kafka.enabled is false")
+	ErrKafkaAddressWithKafkaDisabled               = errors.New("kafka.address must be empty when kafka.enabled is false")
+	ErrWritePercentageSplitWithKafkaEnabled        = errors.New("migration.write_percentage must be 0 or 100 when kafka.enabled is true; percentage-based split routing is only supported without Kafka")
+	ErrDistributorSendToIngestersWithoutKafka      = errors.New("migration.distributor_send_to_ingesters_enabled must not be set when kafka.enabled is false; partition owners are already ingesters and the flag would cause duplicate writes")
 
 	consumeFromPositionOptions = []string{consumeFromLastOffset, consumeFromStart, consumeFromEnd, consumeFromTimestamp}
 
@@ -103,6 +105,16 @@ func (cfg *Config) Validate() error {
 		if cfg.KafkaConfig.Address != "" {
 			return ErrKafkaAddressWithKafkaDisabled
 		}
+		// Partition owners ARE ingesters; this flag would cause duplicate writes.
+		if cfg.Migration.DistributorSendToIngestersEnabled {
+			return ErrDistributorSendToIngestersWithoutKafka
+		}
+	}
+
+	// Percentage-based split routing is only supported without Kafka.  With Kafka
+	// enabled, series routed to the classic path bypass Kafka and lose durability.
+	if cfg.KafkaConfig.Enabled && cfg.Migration.WritePercentage > 0 && cfg.Migration.WritePercentage < 100 {
+		return ErrWritePercentageSplitWithKafkaEnabled
 	}
 
 	return nil

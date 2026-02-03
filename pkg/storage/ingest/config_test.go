@@ -281,11 +281,19 @@ func TestConfig_Validate(t *testing.T) {
 				cfg.Migration.WritePercentage = 0
 			},
 		},
-		"should pass if write percentage is 50": {
+		"should fail if write percentage is between 1-99 and kafka is enabled": {
 			setup: func(cfg *Config) {
 				cfg.Enabled = true
 				cfg.KafkaConfig.Address = "localhost"
 				cfg.KafkaConfig.Topic = "test"
+				cfg.Migration.WritePercentage = 50
+			},
+			expectedErr: ErrWritePercentageSplitWithKafkaEnabled,
+		},
+		"should pass if write percentage is 50 and kafka is disabled": {
+			setup: func(cfg *Config) {
+				cfg.Enabled = true
+				cfg.KafkaConfig.Enabled = false
 				cfg.Migration.WritePercentage = 50
 			},
 		},
@@ -314,6 +322,24 @@ func TestConfig_Validate(t *testing.T) {
 				cfg.KafkaConfig.Topic = "test"
 				cfg.PartitionIsolationEnabled = true
 				cfg.Migration.WritePercentage = 100
+			},
+		},
+		"should fail if distributor_send_to_ingesters_enabled is set without kafka": {
+			setup: func(cfg *Config) {
+				cfg.Enabled = true
+				cfg.KafkaConfig.Enabled = false
+				cfg.Migration.DistributorSendToIngestersEnabled = true
+				cfg.Migration.WritePercentage = 100
+			},
+			expectedErr: ErrDistributorSendToIngestersWithoutKafka,
+		},
+		"should pass if distributor_send_to_ingesters_enabled is set with kafka": {
+			setup: func(cfg *Config) {
+				cfg.Enabled = true
+				cfg.KafkaConfig.Address = "localhost"
+				cfg.KafkaConfig.Topic = "test"
+				cfg.Migration.DistributorSendToIngestersEnabled = true
+				cfg.Migration.WritePercentage = 0
 			},
 		},
 		"should fail if kafka is disabled but address is configured": {
