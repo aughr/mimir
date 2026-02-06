@@ -2994,6 +2994,11 @@ func TestDistributor_PartitionRingWithoutKafka_ReliabilitySemantics(t *testing.T
 						configure: func(config *Config) {
 							config.PreferAvailabilityZones = []string{preferredZone}
 							config.MinimizeIngesterRequests = minimizeIngesterRequests
+							// Enable partition-ring-without-Kafka mode: disable Kafka and
+							// enable partition isolation so applyStrictQuorum enforces
+							// RF-based zone quorum (2 of 3) instead of the Kafka default (1 of 3).
+							config.IngestStorageConfig.KafkaConfig.Enabled = false
+							config.IngestStorageConfig.PartitionIsolationEnabled = true
 						},
 					})
 
@@ -3062,10 +3067,9 @@ func TestDistributor_PartitionRingWithoutKafka_WriteReliabilitySemantics(t *test
 				"zone-c": {numIngesters: 3, happyIngesters: 3},
 			},
 			numPartitions: 3,
-			// Whether this fails depends on whether any series hash-routes to partition 0.
-			// With only 2 series we can't guarantee this, but we accept either outcome.
-			// The important test is that writes to healthy partitions succeed.
-			expectedErr: false, // Most likely routes to healthy partitions with few series.
+			// Partition 0 lost quorum (2 of 3 zones failed). Series that hash-route to
+			// partition 0 will fail, causing the overall push to fail.
+			expectedErr: true,
 		},
 	}
 
