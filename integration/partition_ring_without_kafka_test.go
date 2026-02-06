@@ -684,3 +684,152 @@ func TestPartitionRingWithoutKafkaFlipFlopRouting(t *testing.T) {
 		}
 	}
 }
+
+// TestPartitionRingWithoutKafkaCrossPartitionCrossZoneReliability validates the design's flagship
+// reliability guarantee: losing ingesters in different partitions across different zones does NOT
+// cause query or write failures. This is the key advantage over classic ring architecture, where
+// such a failure pattern causes "zone contamination" and 100% query failure.
+//
+// Topology: 3 partitions × 3 zones = 9 ingesters
+//
+//	partition 0: ingester-a-0 (zone-a), ingester-b-0 (zone-b), ingester-c-0 (zone-c)
+//	partition 1: ingester-a-1 (zone-a), ingester-b-1 (zone-b), ingester-c-1 (zone-c)
+//	partition 2: ingester-a-2 (zone-a), ingester-b-2 (zone-b), ingester-c-2 (zone-c)
+//
+// Failure pattern: kill ingester-a-0 (partition 0, zone-a) and ingester-b-1 (partition 1, zone-b).
+// With per-partition isolation:
+//   - partition 0 still has zone-b and zone-c (2 of 3 quorum) ✓
+//   - partition 1 still has zone-a and zone-c (2 of 3 quorum) ✓
+//   - partition 2 has all 3 zones ✓
+//
+// All reads and writes must succeed.
+func TestPartitionRingWithoutKafkaCrossPartitionCrossZoneReliability(t *testing.T) {
+	s, err := e2e.NewScenario(networkName)
+	require.NoError(t, err)
+	defer s.Close()
+
+	flags := mergeFlags(
+		BlocksStorageFlags(),
+		BlocksStorageS3Flags(),
+		PartitionRingWithoutKafkaFlags(),
+	)
+
+	// Start dependencies.
+	consul := e2edb.NewConsul()
+	minio := e2edb.NewMinio(9000, flags["-blocks-storage.s3.bucket-name"])
+	require.NoError(t, s.StartAndWaitReady(consul, minio))
+
+	// Start Mimir components — 3 ingesters per zone, 3 partitions.
+	ingesterFlags := func(zone string) map[string]string {
+		return mergeFlags(flags, map[string]string{
+			"-ingester.ring.instance-availability-zone": zone,
+		})
+	}
+
+	// 9 ingesters total: 3 per zone. The trailing ordinal determines partition ownership.
+	ingesterA0 := e2emimir.NewIngester("ingester-a-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-a"))
+	ingesterA1 := e2emimir.NewIngester("ingester-a-1", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-a"))
+	ingesterA2 := e2emimir.NewIngester("ingester-a-2", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-a"))
+	ingesterB0 := e2emimir.NewIngester("ingester-b-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-b"))
+	ingesterB1 := e2emimir.NewIngester("ingester-b-1", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-b"))
+	ingesterB2 := e2emimir.NewIngester("ingester-b-2", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-b"))
+	ingesterC0 := e2emimir.NewIngester("ingester-c-0", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-c"))
+	ingesterC1 := e2emimir.NewIngester("ingester-c-1", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-c"))
+	ingesterC2 := e2emimir.NewIngester("ingester-c-2", consul.NetworkHTTPEndpoint(), ingesterFlags("zone-c"))
+	require.NoError(t, s.StartAndWaitReady(ingesterA0, ingesterA1, ingesterA2, ingesterB0, ingesterB1, ingesterB2, ingesterC0, ingesterC1, ingesterC2))
+
+	distributor := e2emimir.NewDistributor("distributor", consul.NetworkHTTPEndpoint(), flags)
+	querier := e2emimir.NewQuerier("querier", consul.NetworkHTTPEndpoint(), flags)
+	require.NoError(t, s.StartAndWaitReady(distributor, querier))
+
+	// Wait until all 9 ingesters are visible in the ring.
+	require.NoError(t, distributor.WaitSumMetricsWithOptions(e2e.Equals(9), []string{"cortex_ring_members"}, e2e.WithLabelMatchers(
+		labels.MustNewMatcher(labels.MatchEqual, "name", "ingester"),
+		labels.MustNewMatcher(labels.MatchEqual, "state", "ACTIVE"))))
+
+	require.NoError(t, querier.WaitSumMetricsWithOptions(e2e.Equals(9), []string{"cortex_ring_members"}, e2e.WithLabelMatchers(
+		labels.MustNewMatcher(labels.MatchEqual, "name", "ingester"),
+		labels.MustNewMatcher(labels.MatchEqual, "state", "ACTIVE"))))
+
+	// Wait for all 3 partitions to be Active.
+	for _, svc := range []*e2emimir.MimirService{distributor, querier} {
+		require.NoError(t, svc.WaitSumMetricsWithOptions(e2e.Equals(3), []string{"cortex_partition_ring_partitions"}, e2e.WithLabelMatchers(
+			labels.MustNewMatcher(labels.MatchEqual, "name", "ingester-partitions"),
+			labels.MustNewMatcher(labels.MatchEqual, "state", "Active"))))
+	}
+
+	client, err := e2emimir.NewClient(distributor.HTTPEndpoint(), querier.HTTPEndpoint(), "", "", userID)
+	require.NoError(t, err)
+
+	// --- Phase 1: Push series while all ingesters are healthy ---
+	now := time.Now()
+	numSeries := 100 // Enough to spread across all 3 partitions via hashing.
+	expectedVectors := map[string]model.Vector{}
+
+	for i := 1; i <= numSeries; i++ {
+		metricName := fmt.Sprintf("reliability_series_%d", i)
+		series, expectedVector, _ := generateAlternatingSeries(i)(metricName, now)
+		res, err := client.Push(series)
+		require.NoError(t, err)
+		require.Equal(t, 200, res.StatusCode)
+		expectedVectors[metricName] = expectedVector
+	}
+
+	// Verify all queries succeed before failure injection.
+	for metricName, expectedVector := range expectedVectors {
+		result, err := client.Query(metricName, now)
+		require.NoError(t, err)
+		require.Equal(t, model.ValVector, result.Type())
+		assert.Equal(t, expectedVector, result.(model.Vector))
+	}
+
+	// --- Phase 2: Kill ingesters in different partitions across different zones ---
+	// Kill ingester-a-0 (partition 0, zone-a) and ingester-b-1 (partition 1, zone-b).
+	// In classic architecture, this would contaminate zone-a and zone-b, causing 100% failure.
+	// With per-partition isolation, each partition retains 2-of-3 zones.
+	require.NoError(t, ingesterA0.Kill())
+	require.NoError(t, ingesterB1.Kill())
+
+	// --- Phase 3: Verify queries still succeed for ALL previously-pushed series ---
+	// This is the key assertion: per-partition isolation means queries succeed even though
+	// we've lost ingesters in 2 different zones.
+	for metricName, expectedVector := range expectedVectors {
+		result, err := client.Query(metricName, now)
+		require.NoError(t, err, "query for %s should succeed after cross-partition cross-zone failures", metricName)
+		require.Equal(t, model.ValVector, result.Type())
+		assert.Equal(t, expectedVector, result.(model.Vector))
+	}
+
+	// --- Phase 4: Verify new writes still succeed ---
+	// Push additional series after the failures — writes should route to healthy owners.
+	for i := numSeries + 1; i <= numSeries+20; i++ {
+		metricName := fmt.Sprintf("reliability_series_%d", i)
+		series, expectedVector, _ := generateFloatSeries(metricName, now)
+		res, err := client.Push(series)
+		require.NoError(t, err, "push of %s should succeed after failures", metricName)
+		require.Equal(t, 200, res.StatusCode)
+		expectedVectors[metricName] = expectedVector
+	}
+
+	// Query the newly-pushed series too.
+	for i := numSeries + 1; i <= numSeries+20; i++ {
+		metricName := fmt.Sprintf("reliability_series_%d", i)
+		result, err := client.Query(metricName, now)
+		require.NoError(t, err, "query for newly-pushed %s should succeed", metricName)
+		require.Equal(t, model.ValVector, result.Type())
+		assert.Equal(t, expectedVectors[metricName], result.(model.Vector))
+	}
+
+	// --- Phase 5: Kill a THIRD ingester in yet another partition and zone ---
+	// Kill ingester-c-2 (partition 2, zone-c). Now we have the maximum survivable spread:
+	// one failure per partition, each in a different zone. Every partition still has 2 of 3 zones.
+	require.NoError(t, ingesterC2.Kill())
+
+	// All queries should still succeed.
+	for metricName, expectedVector := range expectedVectors {
+		result, err := client.Query(metricName, now)
+		require.NoError(t, err, "query for %s should succeed with 3 failures in max survivable spread", metricName)
+		require.Equal(t, model.ValVector, result.Type())
+		assert.Equal(t, expectedVector, result.(model.Vector))
+	}
+}
